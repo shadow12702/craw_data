@@ -1,10 +1,9 @@
 import asyncio
-import csv
 import logging
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
-from crawl4ai import AsyncWebCrawler, CrawlResult
-from crawl4ai.extraction_strategy import LLMExtractionStrategy
+import pandas as pd
+from crawl4ai import AsyncWebCrawler
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -43,10 +42,13 @@ class CrawlAIBenhVienScraper:
         logger.info(f"Crawling: {url} ({len(self.visited_urls)}/{self.max_pages})")
 
         try:
-            # Define extraction schema with LLM
+            # Define extraction schema with LLM using new API
+            llm_config = LLMConfig(
+                provider="openai", api_token=None  # Will use OPENAI_API_KEY env var
+            )
+
             extraction_strategy = LLMExtractionStrategy(
-                provider="openai",
-                api_token=None,  # Will use OPENAI_API_KEY env var
+                llm_config=llm_config,
                 schema={
                     "type": "object",
                     "properties": {
@@ -123,30 +125,18 @@ class CrawlAIBenhVienScraper:
                         ):
                             queue.append(link)
 
-    def export_to_csv(self, filename="benhvien_data_crawl4ai.csv"):
-        """Export collected items to CSV"""
+    def export_to_xlsx(self, filename="benhvien_data_crawl4ai.xlsx"):
+        """Export collected items to Excel XLSX with proper Vietnamese encoding"""
         if not self.items_data:
             logger.warning("No data to export")
             return
 
-        fieldnames = [
-            "title",
-            "date",
-            "author_source",
-            "email_phone",
-            "address_city",
-            "services_specialties",
-            "url",
-        ]
-
         try:
-            with open(filename, "w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-                writer.writeheader()
-                writer.writerows(self.items_data)
+            df = pd.DataFrame(self.items_data)
+            df.to_excel(filename, index=False, engine="openpyxl")
             logger.info(f"Exported {len(self.items_data)} items to {filename}")
         except Exception as e:
-            logger.error(f"Error exporting to CSV: {e}")
+            logger.error(f"Error exporting to XLSX: {e}")
 
     async def run(self):
         """Run the scraper"""
@@ -155,12 +145,12 @@ class CrawlAIBenhVienScraper:
                 self.crawler = crawler
                 await self.crawl_recursive()
 
-            self.export_to_csv()
+            self.export_to_xlsx()
 
             print(f"\n=== Crawl4AI Summary ===")
             print(f"Total items collected: {len(self.items_data)}")
             print(f"Total URLs visited: {len(self.visited_urls)}")
-            print(f"Exported to: benhvien_data_crawl4ai.csv")
+            print(f"Exported to: benhvien_data_crawl4ai.xlsx")
 
         except Exception as e:
             logger.error(f"Fatal error: {e}")

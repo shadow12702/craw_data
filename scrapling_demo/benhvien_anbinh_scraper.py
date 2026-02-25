@@ -1,7 +1,7 @@
-import csv
 import logging
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
+import pandas as pd
 from scrapling.spiders import Spider, Request, Response
 
 logging.basicConfig(level=logging.INFO)
@@ -137,44 +137,32 @@ class BenhVienAnBinhSpider(Spider):
             logger.warning(f"Error in extract_item: {e}")
             return None
 
-    def export_to_csv(self, filename="benhvien_data.csv"):
-        """Export collected items to CSV"""
+    def export_to_xlsx(self, filename="benhvien_data.xlsx"):
+        """Export collected items to Excel XLSX with proper Vietnamese encoding"""
         if not self.items_data:
             logger.warning("No data to export")
             return
 
-        fieldnames = [
-            "title",
-            "date",
-            "author_source",
-            "email_phone",
-            "address_city",
-            "services_specialties",
-            "url",
-        ]
-
         try:
-            with open(filename, "w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(self.items_data)
+            df = pd.DataFrame(self.items_data)
+            df.to_excel(filename, index=False, engine="openpyxl")
             logger.info(f"Exported {len(self.items_data)} items to {filename}")
         except Exception as e:
-            logger.error(f"Error exporting to CSV: {e}")
+            logger.error(f"Error exporting to XLSX: {e}")
 
 
 def main():
     spider = BenhVienAnBinhSpider()
     result = spider.start()
 
-    # Export to CSV
-    spider.export_to_csv("benhvien_data.csv")
+    # Export to XLSX
+    spider.export_to_xlsx("benhvien_data.xlsx")
 
     print(f"\n=== Crawl Summary ===")
     print(f"Total items collected: {len(spider.items_data)}")
     print(f"Total URLs visited: {len(spider.visited_urls)}")
     print(f"Result status: {result.status}")
-    print(f"Exported to: benhvien_data.csv")
+    print(f"Exported to: benhvien_data.xlsx")
 
 
 if __name__ == "__main__":
