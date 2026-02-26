@@ -1,7 +1,7 @@
 # Minimal dependencies for the demo
-scrapling[fetchers]
+scrapling
+pandas
 
-# For crawl4ai-based scraper (optional)
-# Uncomment if using crawl4ai
-# crawl4ai
-# openai  # Required for LLM extraction in crawl4ai
+# For crawl4ai-based scraper
+crawl4ai
+# openai  # Optional: for LLM extraction in crawl4ai
