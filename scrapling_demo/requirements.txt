@@ -5,3 +5,6 @@ pandas
 # For crawl4ai-based scraper
 crawl4ai
 # openai  # Optional: for LLM extraction in crawl4ai
+
+# Postgres connection test (scrapling_demo/test.py)
+psycopg[binary]

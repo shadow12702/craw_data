@@ -1,15 +1,19 @@
 import asyncio
-import csv
 import hashlib
+import json
 import logging
 import re
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional
-from urllib.error import HTTPError, URLError
 from urllib.parse import ParseResult, urljoin, urlparse, urlunparse
-from urllib.request import Request, urlopen
+
+try:
+    import psycopg
+except Exception:  # pragma: no cover
+    psycopg = None  # type: ignore
 
 try:
     from crawl4ai import AsyncWebCrawler, CacheMode, CrawlerRunConfig
@@ -243,159 +247,161 @@ class PageItem:
     crawled_at: str
 
 
-class StreamingExporter:
-    def __init__(self, output_root: str = "data_craw"):
-        self.root = Path(output_root)
-        self.content_dir = self.root / "content"
-        self.image_dir = self.root / "image"
-        self.video_dir = self.root / "video"
-        self.videos_csv = self.video_dir / "videos.csv"
+class PostgresWriter:
+    """
+    Write crawled pages to Postgres (static config from scrapling_demo/db_config.py).
 
-        self.content_dir.mkdir(parents=True, exist_ok=True)
-        self.image_dir.mkdir(parents=True, exist_ok=True)
-        self.video_dir.mkdir(parents=True, exist_ok=True)
+    Target tables (must exist already):
+      - storage_data(id UUID PK, title, content, created_at, link)
+      - storage_video(id UUID PK, storage_id UUID FK, video_url)
+      - storage_image(id UUID PK, storage_id UUID FK, image_url)
+    """
 
-        self._csv_lock = asyncio.Lock()
-        self._image_map_lock = asyncio.Lock()
-        self._downloaded_images: dict[str, str] = {}  # url -> filename
-
-        if not self.videos_csv.exists() or self.videos_csv.stat().st_size == 0:
-            with open(self.videos_csv, "w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(
-                    f,
-                    fieldnames=[
-                        "page_id",
-                        "page_title",
-                        "page_url",
-                        "video_name",
-                        "video_url",
-                        "crawled_at",
-                    ],
-                )
-                writer.writeheader()
-
-    def _page_id(self, page_url: str) -> str:
-        return _short_hash(page_url)
-
-    def _content_path(self, page: PageItem) -> Path:
-        page_id = self._page_id(page.url)
-        title_safe = _safe_filename(page.title)[:90]
-        return self.content_dir / f"{page_id}__{title_safe}.md"
-
-    def _download_image_sync(self, url: str, dst_path: Path) -> bool:
-        if dst_path.exists() and dst_path.stat().st_size > 0:
-            return True
-
-        dst_path.parent.mkdir(parents=True, exist_ok=True)
-        headers = {"User-Agent": "Mozilla/5.0 (compatible; benhvien-crawler/1.0)"}
-        req = Request(url, headers=headers)
-
+    def __init__(self):
         try:
-            with urlopen(req, timeout=30) as resp, open(dst_path, "wb") as f:
-                f.write(resp.read())
-            return True
-        except (HTTPError, URLError, TimeoutError) as e:
-            logger.warning(f"Image download failed: {url} -> {dst_path.name} ({e})")
-            return False
-        except Exception as e:
-            logger.warning(f"Image download error: {url} ({e})")
-            return False
+            from scrapling_demo.db_config import load_postgres_config
+        except Exception:
+            from db_config import load_postgres_config  # type: ignore
 
-    async def _download_one_image(self, page_id: str, idx: int, img: MediaItem) -> str:
-        async with self._image_map_lock:
-            cached = self._downloaded_images.get(img.url)
-        if cached:
-            return f"- {img.name or 'none'}: `{cached}` ({img.url})"
+        self.cfg = load_postgres_config()
+        self._sem = asyncio.Semaphore(2)  # limit concurrent DB writes
 
-        parsed = urlparse(img.url)
-        ext = Path(parsed.path).suffix.lower()
-        if ext not in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg"):
-            ext = ".jpg"
+    async def start(self) -> None:
+        if psycopg is None:
+            raise RuntimeError("Missing psycopg. Install: pip install psycopg[binary]")
+        return
 
-        name_safe = _safe_filename(img.name or "none")[:60] or "none"
-        img_filename = f"{page_id}__{idx:03d}__{name_safe}{ext}"
-        img_path = self.image_dir / img_filename
+    async def stop(self) -> None:
+        return
 
-        ok = await asyncio.to_thread(self._download_image_sync, img.url, img_path)
-        if ok:
-            async with self._image_map_lock:
-                self._downloaded_images.setdefault(img.url, img_filename)
-            return f"- {img.name or 'none'}: `{img_filename}` ({img.url})"
-        return f"- {img.name or 'none'}: (download_failed) ({img.url})"
+    async def write(self, page: PageItem) -> None:
+        async with self._sem:
+            await asyncio.to_thread(self._upsert_page, page)
 
-    async def export_page(self, page: PageItem) -> None:
-        page_id = self._page_id(page.url)
-        content_path = self._content_path(page)
+    @staticmethod
+    def _doc_id_from_url(url: str) -> uuid.UUID:
+        # Deterministic UUID so reruns update the same record
+        return uuid.uuid5(uuid.NAMESPACE_URL, url)
 
-        if not content_path.exists():
-            with open(content_path, "w", encoding="utf-8") as f_md:
-                f_md.write(f"# {page.title}\n\n")
-                f_md.write(f"- URL: {page.url}\n")
-                f_md.write(f"- Crawled at: {page.crawled_at}\n\n")
-                f_md.write("---\n\n")
-                f_md.write((page.markdown or "").strip() + "\n\n")
-                f_md.write("---\n\n")
-                f_md.write("## Image files\n\n")
-                f_md.write("(downloaded to `data_craw/image/`)\n\n")
-                f_md.write("## Videos\n\n")
-                f_md.write("(listed in `data_craw/video/videos.csv`)\n")
+    @staticmethod
+    def _media_id(doc_id: uuid.UUID, kind: str, media_url: str) -> uuid.UUID:
+        return uuid.uuid5(uuid.NAMESPACE_URL, f"{doc_id}|{kind}|{media_url}")
 
-        # Download images (I/O bound) in parallel
-        image_lines: list[str] = []
-        if page.images:
-            sem = asyncio.Semaphore(8)
+    def _upsert_page(self, page: PageItem) -> None:
+        doc_id = self._doc_id_from_url(page.url)
+        content = (page.markdown or "").strip()
 
-            async def _guarded(i: int, it: MediaItem):
-                async with sem:
-                    return await self._download_one_image(page_id, i, it)
+        with psycopg.connect(self.cfg.dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO storage_data (id, title, content, link)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (id) DO UPDATE
+                      SET title = EXCLUDED.title,
+                          content = EXCLUDED.content,
+                          link = EXCLUDED.link;
+                    """,
+                    (doc_id, (page.title or "")[:255], content, page.url[:500]),
+                )
 
-            image_lines = await asyncio.gather(*(_guarded(i, it) for i, it in enumerate(page.images, 1)))
-
-        with open(content_path, "a", encoding="utf-8") as f_md:
-            f_md.write("\n---\n\n### Images\n\n")
-            if image_lines:
-                f_md.write("\n".join(image_lines) + "\n")
-            else:
-                f_md.write("- none\n")
-            f_md.write("\n### Videos\n\n")
-            if page.videos:
-                f_md.write("- (see CSV) `data_craw/video/videos.csv`\n")
-            else:
-                f_md.write("- none\n")
-
-        if page.videos:
-            async with self._csv_lock:
-                with open(self.videos_csv, "a", newline="", encoding="utf-8") as f:
-                    writer = csv.DictWriter(
-                        f,
-                        fieldnames=[
-                            "page_id",
-                            "page_title",
-                            "page_url",
-                            "video_name",
-                            "video_url",
-                            "crawled_at",
+                if page.images:
+                    cur.executemany(
+                        """
+                        INSERT INTO storage_image (id, storage_id, image_url)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (id) DO NOTHING;
+                        """,
+                        [
+                            (self._media_id(doc_id, "image", img.url), doc_id, img.url[:500])
+                            for img in page.images
                         ],
                     )
-                    for v in page.videos:
-                        writer.writerow(
-                            {
-                                "page_id": page_id,
-                                "page_title": page.title,
-                                "page_url": page.url,
-                                "video_name": v.name or "none",
-                                "video_url": v.url,
-                                "crawled_at": page.crawled_at,
-                            }
-                        )
+
+                if page.videos:
+                    cur.executemany(
+                        """
+                        INSERT INTO storage_video (id, storage_id, video_url)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (id) DO NOTHING;
+                        """,
+                        [
+                            (self._media_id(doc_id, "video", v.url), doc_id, v.url[:500])
+                            for v in page.videos
+                        ],
+                    )
+            conn.commit()
+
+class CrawlState:
+    """
+    Append-only event log to support resume after stop.
+    Stored at: <output_root>/state/events.jsonl
+    """
+
+    def __init__(self, output_root: str, events_filename: str = "events.jsonl"):
+        self.state_dir = Path(output_root) / "state"
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.events_path = self.state_dir / events_filename
+        self._lock = asyncio.Lock()
+
+    async def record(self, event_type: str, url: str, ok: Optional[bool] = None, error: Optional[str] = None) -> None:
+        rec: dict[str, object] = {"ts": _now_iso(), "type": event_type, "url": url}
+        if ok is not None:
+            rec["ok"] = bool(ok)
+        if error:
+            rec["error"] = str(error)[:500]
+        line = json.dumps(rec, ensure_ascii=False)
+        async with self._lock:
+            with open(self.events_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+
+    def load(self) -> tuple[set[str], set[str], set[str], set[str]]:
+        """
+        Returns (enqueued, started, done_ok, done_failed)
+        """
+        enqueued: set[str] = set()
+        started: set[str] = set()
+        done_ok: set[str] = set()
+        done_failed: set[str] = set()
+
+        if not self.events_path.exists():
+            return enqueued, started, done_ok, done_failed
+
+        try:
+            with open(self.events_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    t = rec.get("type")
+                    u = rec.get("url")
+                    if not isinstance(u, str) or not u:
+                        continue
+                    if t == "enqueue":
+                        enqueued.add(u)
+                    elif t == "start":
+                        started.add(u)
+                    elif t == "done":
+                        if rec.get("ok") is True:
+                            done_ok.add(u)
+                        else:
+                            done_failed.add(u)
+        except Exception:
+            return enqueued, started, done_ok, done_failed
+
+        return enqueued, started, done_ok, done_failed
 
 
 class CrawlAIBenhVienScraper:
     """
-    Crawl https://benhvienanbinh.vn/ (and related domains) and export immediately:
-    - data_craw/content: 1 page = 1 .md file (text in markdown)
-    - data_craw/image: download images, name from caption/alt/title (or 'none')
-    - data_craw/video/videos.csv: append all video URLs
+    Crawl https://benhvienanbinh.vn/ (and related domains) and write to Postgres:
+    - storage_data: title, content (markdown; URL is embedded at top), created_at
+    - storage_image: image_url
+    - storage_video: video_url
     """
 
     def __init__(
@@ -406,6 +412,8 @@ class CrawlAIBenhVienScraper:
         allow_domains: Optional[list[str]] = None,
         page_timeout_ms: int = 300_000,
         output_root: str = "data_craw",
+        resume: bool = True,
+        retry_failed_on_resume: bool = False,
     ):
         self.start_url = start_url
         host = urlparse(start_url).netloc.lower().strip(".")
@@ -418,11 +426,17 @@ class CrawlAIBenhVienScraper:
         self.allow_domains = allow_domains or []
         self.page_timeout_ms = int(page_timeout_ms)
         self.output_root = output_root
+        self.resume = bool(resume)
+        self.retry_failed_on_resume = bool(retry_failed_on_resume)
 
         self.crawler = None
-        self.exporter = StreamingExporter(output_root=self.output_root)
+        self.db_writer = PostgresWriter()
+        # Use a separate state file for DB mode so old file-export runs don't block re-crawling.
+        self.state = CrawlState(output_root=self.output_root, events_filename="events_db.jsonl")
 
-        self.visited_urls: set[str] = set()
+        self.visited_urls: set[str] = set()  # done_ok only
+        self.failed_urls: set[str] = set()
+        self.processing_urls: set[str] = set()
         self.queued_urls: set[str] = set()
 
     def _should_skip_url(self, url: str) -> bool:
@@ -438,15 +452,17 @@ class CrawlAIBenhVienScraper:
     def _is_allowed(self, url: str) -> bool:
         return is_related_domain(url, self.base_domain, self.allow_domains)
 
-    async def _crawl_one(self, url: str) -> tuple[Optional[PageItem], list[str]]:
+    async def _crawl_one(self, url: str) -> tuple[Optional[PageItem], list[str], Optional[str]]:
         if url in self.visited_urls:
-            return None, []
+            return None, [], None
         if self.max_pages and len(self.visited_urls) >= self.max_pages:
-            return None, []
+            return None, [], "max_pages_reached"
         if not self._is_allowed(url) or self._should_skip_url(url):
-            return None, []
+            return None, [], "not_allowed_or_skipped"
+        if url in self.processing_urls:
+            return None, [], "already_processing"
 
-        self.visited_urls.add(url)
+        self.processing_urls.add(url)
         logger.info(f"Crawling: {url} ({len(self.visited_urls)}/{self.max_pages or '∞'})")
 
         try:
@@ -458,64 +474,88 @@ class CrawlAIBenhVienScraper:
                 result = await self.crawler.arun(url=url, config=run_config)
             else:
                 result = await self.crawler.arun(url=url)
+
+            if not getattr(result, "success", False):
+                msg = getattr(result, "error_message", "") or "unknown error"
+                return None, [], f"crawl_failed: {msg}"
+
+            markdown = getattr(result, "markdown", "") or ""
+            html = getattr(result, "html", "") or ""
+
+            title = extract_title_from_markdown(markdown) or extract_title_from_html(html) or url
+            images, videos = extract_media(markdown, html, url)
+            content_md = strip_media_from_markdown(markdown) if markdown else ""
+
+            if not content_md.strip() and html:
+                content_md = html.strip()
+
+            item = PageItem(
+                url=url,
+                title=title,
+                markdown=content_md,
+                images=images,
+                videos=videos,
+                crawled_at=_now_iso(),
+            )
+
+            raw_links: list[Optional[str]] = []
+            links_obj = getattr(result, "links", None) or {}
+            for bucket in ("internal", "external"):
+                raw_links.extend(_coerce_link(x) for x in (links_obj.get(bucket) or []))
+
+            discovered: list[str] = []
+            for raw in raw_links:
+                if not raw:
+                    continue
+                nu = normalize_url(raw, url)
+                if not nu:
+                    continue
+                if self._is_allowed(nu) and not self._should_skip_url(nu):
+                    discovered.append(nu)
+
+            # de-dupe preserving order
+            seen: set[str] = set()
+            deduped: list[str] = []
+            for u in discovered:
+                if u not in seen:
+                    seen.add(u)
+                    deduped.append(u)
+
+            return item, deduped, None
         except Exception as e:
-            logger.warning(f"Failed to fetch {url}: {e}")
-            return None, []
-
-        if not getattr(result, "success", False):
-            msg = getattr(result, "error_message", "") or "unknown error"
-            logger.warning(f"Failed to crawl {url}: {msg}")
-            return None, []
-
-        markdown = getattr(result, "markdown", "") or ""
-        html = getattr(result, "html", "") or ""
-
-        title = extract_title_from_markdown(markdown) or extract_title_from_html(html) or url
-        images, videos = extract_media(markdown, html, url)
-        content_md = strip_media_from_markdown(markdown) if markdown else ""
-
-        if not content_md.strip() and html:
-            content_md = html.strip()
-
-        item = PageItem(
-            url=url,
-            title=title,
-            markdown=content_md,
-            images=images,
-            videos=videos,
-            crawled_at=_now_iso(),
-        )
-
-        raw_links: list[Optional[str]] = []
-        links_obj = getattr(result, "links", None) or {}
-        for bucket in ("internal", "external"):
-            raw_links.extend(_coerce_link(x) for x in (links_obj.get(bucket) or []))
-
-        discovered: list[str] = []
-        for raw in raw_links:
-            if not raw:
-                continue
-            nu = normalize_url(raw, url)
-            if not nu:
-                continue
-            if self._is_allowed(nu) and not self._should_skip_url(nu):
-                discovered.append(nu)
-
-        # de-dupe preserving order
-        seen: set[str] = set()
-        deduped: list[str] = []
-        for u in discovered:
-            if u not in seen:
-                seen.add(u)
-                deduped.append(u)
-
-        return item, deduped
+            return None, [], f"fetch_error: {e}"
+        finally:
+            self.processing_urls.discard(url)
 
     async def crawl_site(self) -> None:
         start = normalize_url(self.start_url, self.start_url) or self.start_url
         q: asyncio.Queue[str] = asyncio.Queue()
-        await q.put(start)
-        self.queued_urls.add(start)
+
+        if self.resume:
+            enqueued, started, done_ok, done_failed = self.state.load()
+            self.visited_urls = set(done_ok)
+            self.failed_urls = set(done_failed)
+            self.queued_urls = set(enqueued)
+
+            pending = (set(enqueued) | set(started)) - set(done_ok)
+            if not self.retry_failed_on_resume:
+                pending -= set(done_failed)
+
+            if start not in self.queued_urls and start not in self.visited_urls:
+                self.queued_urls.add(start)
+                pending.add(start)
+                await self.state.record("enqueue", start)
+
+            for u in pending:
+                await q.put(u)
+
+            logger.info(
+                f"Resume enabled: done_ok={len(done_ok)}, done_failed={len(done_failed)}, pending={q.qsize()}"
+            )
+        else:
+            await q.put(start)
+            self.queued_urls.add(start)
+            await self.state.record("enqueue", start)
 
         stop_event = asyncio.Event()
 
@@ -532,11 +572,23 @@ class CrawlAIBenhVienScraper:
                     if stop_event.is_set():
                         continue
 
-                    item, discovered = await self._crawl_one(url)
-                    if item:
-                        await self.exporter.export_page(item)
-                        if self.max_pages and len(self.visited_urls) >= self.max_pages:
-                            stop_event.set()
+                    await self.state.record("start", url)
+                    item, discovered, err = await self._crawl_one(url)
+
+                    if item is not None and err is None:
+                        try:
+                            await self.db_writer.write(item)
+                        except Exception as e:
+                            self.failed_urls.add(url)
+                            await self.state.record("done", url, ok=False, error=f"db_write_error: {e}")
+                        else:
+                            self.visited_urls.add(url)
+                            await self.state.record("done", url, ok=True)
+                            if self.max_pages and len(self.visited_urls) >= self.max_pages:
+                                stop_event.set()
+                    elif err:
+                        self.failed_urls.add(url)
+                        await self.state.record("done", url, ok=False, error=err)
 
                     for nu in discovered:
                         if stop_event.is_set():
@@ -544,6 +596,7 @@ class CrawlAIBenhVienScraper:
                         if nu in self.visited_urls or nu in self.queued_urls:
                             continue
                         self.queued_urls.add(nu)
+                        await self.state.record("enqueue", nu)
                         await q.put(nu)
                 finally:
                     q.task_done()
@@ -558,14 +611,13 @@ class CrawlAIBenhVienScraper:
         try:
             async with AsyncWebCrawler() as crawler:
                 self.crawler = crawler
+                await self.db_writer.start()
                 await self.crawl_site()
+                await self.db_writer.stop()
 
             print("\n=== Crawl4AI Summary ===")
             print(f"Total URLs visited: {len(self.visited_urls)}")
-            print(f"Output folder: {self.output_root}")
-            print(
-                f"Exported to: {self.output_root}/content, {self.output_root}/image, {self.output_root}/video/videos.csv"
-            )
+            print("Exported to Postgres tables: storage_data, storage_image, storage_video")
         except Exception as e:
             logger.error(f"Fatal error: {e}")
 
@@ -578,6 +630,8 @@ async def main():
         allow_domains=["www.benhvienanbinh.vn"],
         page_timeout_ms=300_000,
         output_root="data_craw",
+        resume=True,
+        retry_failed_on_resume=False,
     )
     await scraper.run()
 
