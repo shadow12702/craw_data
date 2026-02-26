@@ -1,12 +1,16 @@
 import asyncio
 import csv
+import hashlib
 import json
 import logging
 import re
+import os
+import uuid
 import pandas as pd
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
 from crawl4ai import AsyncWebCrawler
+import aiohttp
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -45,6 +49,51 @@ class CrawlAIBenhVienScraperSimple:
         # Cây nav tăng dần khi ghi từng kết quả (để gán nav_id cho CSV/JSONL)
         self._nav_key_to_id: dict[tuple[str, int], int] = {}
         self._nav_next_id = 2
+        # Khi đọc từ file markdown * [Label](URL): nhóm theo label để xuất CSV riêng
+        self._label_to_urls: dict[str, list[str]] = {}
+
+    def load_links_from_markdown(self, filepath: str) -> bool:
+        """
+        Đọc file chứa link dạng markdown: * [Label](URL) hoặc - [Label](URL).
+        Gán self.urls_to_process = (url, label) cho từng URL (crawl mỗi URL một lần),
+        self._label_to_urls = {label: [url1, url2, ...]} để sau này chia CSV theo label.
+        """
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                text = f.read()
+        except FileNotFoundError:
+            logger.error(f"File not found: {filepath}")
+            return False
+
+        # * [Label](URL) hoặc - [Label](URL)
+        pattern = re.compile(r"^\s*[-*]\s*\[([^\]]+)\]\((\S+)\)", re.MULTILINE)
+        pairs = pattern.findall(text)
+        if not pairs:
+            logger.warning(f"No * [Label](URL) lines found in {filepath}")
+            return False
+
+        self._label_to_urls = {}
+        seen_urls = set()
+        self.urls_to_process = []
+
+        for label, url in pairs:
+            label = label.strip()
+            url = url.strip()
+            if not url.startswith("http"):
+                continue
+            if label not in self._label_to_urls:
+                self._label_to_urls[label] = []
+            self._label_to_urls[label].append(url)
+            if url not in seen_urls:
+                seen_urls.add(url)
+                self.urls_to_process.append((url, label))
+
+        if self.urls_to_process:
+            self.home_url = self.normalize_path(self.urls_to_process[0][0])
+        logger.info(
+            f"Loaded {len(self.urls_to_process)} unique URLs, {len(self._label_to_urls)} labels from {filepath}"
+        )
+        return True
 
     def load_urls_from_csv(self):
         """Load URLs từ một hoặc nhiều file CSV (cột 'link'/'url', 'title' nếu có)."""
@@ -98,6 +147,32 @@ class CrawlAIBenhVienScraperSimple:
         path = (p.path or "/").rstrip("/") or "/"
         return f"{p.scheme}://{p.netloc}{path}"
 
+    def _domain_from_url(self, url: str) -> str:
+        """Lấy domain từ URL (để crawl cùng site)."""
+        try:
+            return urlparse(url).netloc or ""
+        except Exception:
+            return ""
+
+    def extract_internal_links(self, html: str, base_url: str) -> set[str]:
+        """Chỉ lấy link nội bộ (cùng domain) từ <a href> để mở rộng crawl (trang con)."""
+        out = set()
+        if not html:
+            return out
+        domain = self._domain_from_url(base_url) or self.base_domain
+        try:
+            for m in re.finditer(r'<a[^>]+href=[\'"]([^\'"]+)[\'"]', html, re.IGNORECASE):
+                href = m.group(1).strip()
+                if href.startswith("#") or href.startswith("javascript:") or href.startswith("mailto:"):
+                    continue
+                full = urljoin(base_url, href)
+                p = urlparse(full)
+                if domain and domain in (p.netloc or ""):
+                    out.add(full)
+        except Exception as e:
+            logger.debug(f"extract_internal_links: {e}")
+        return out
+
     def _assign_nav_id_incremental(self, result: dict) -> None:
         """Cập nhật cây nav tăng dần và gán result['nav_id'] (node lá)."""
         if not hasattr(self, "_nav_key_to_id") or not self._nav_key_to_id:
@@ -122,15 +197,16 @@ class CrawlAIBenhVienScraperSimple:
         """Ghi ngay 1 kết quả vào CSV và JSONL (có nav_id, không đợi crawl hết)."""
         self._assign_nav_id_incremental(result)
         self.content_data.append(result)
-        link_str = " | ".join(result.get("link", [])) if isinstance(result.get("link"), list) else str(result.get("link", ""))
+        video_col = self._links_to_column(result.get("video_links", []))
+        image_urls_col = self._links_to_column(result.get("image_urls", []))
         if self._csv_writer:
             self._csv_writer.writerow([
-                result.get("title", ""),
-                result.get("url", ""),
+                self._clean_text(result.get("title", "")),
+                (result.get("url", "") or "").strip(),
                 result.get("nav_id", ""),
-                result.get("content", ""),
-                link_str,
-                result.get("navigation", ""),
+                self._clean_content(result.get("content", "")),
+                video_col,
+                image_urls_col,
                 result.get("timestamp", ""),
             ])
             self._csv_file.flush()
@@ -169,21 +245,65 @@ class CrawlAIBenhVienScraperSimple:
                 if not title:
                     title = self.extract_title_from_html(html)
 
-                # Raw content = toàn bộ markdown (đoạn text content)
-                raw_content = result.markdown or html or ""
+                # Raw content = toàn bộ markdown, bỏ URL (link/video/ảnh đã lưu riêng)
+                raw_content = self._strip_urls_from_content(result.markdown or html or "")
 
-                # Video và link trong page -> cột link (list URL)
+                # Tất cả link + video trong page
                 page_links = self.extract_links_and_videos(html, url)
+                video_links = self.extract_video_links_only(html, url)
+                internal_links = self.extract_internal_links(html, url)
 
                 # Navigation: trang home thì dạng tree node
                 is_home = self.normalize_path(url) == self.home_url
                 navigation = self.extract_navigation_tree(html, url) if is_home else self.extract_navigation(html)
+
+                # Ảnh: trích URL
+                image_urls = self.extract_image_urls(html, url)
+                images_downloaded = []
+                page_folder = ""
+
+                # Mỗi page một folder riêng: data + ảnh trong folder đó
+                pages_dir = getattr(self, "_pages_dir", None)
+                if pages_dir:
+                    page_slug = self._page_slug(url, title)
+                    page_folder = os.path.join(pages_dir, page_slug)
+                    os.makedirs(page_folder, exist_ok=True)
+                    if getattr(self, "_download_images", False) and image_urls:
+                        images_dir = os.path.join(page_folder, "images")
+                        images_downloaded = await self._download_images_batch(
+                            image_urls, images_dir, concurrency=5
+                        )
+                        rel_paths = [os.path.relpath(p, page_folder) for p in images_downloaded]
+                    else:
+                        rel_paths = []
+                    data = {
+                        "title": title,
+                        "url": url,
+                        "content": raw_content,
+                        "video_links": video_links,
+                        "image_urls": image_urls,
+                        "images_downloaded": rel_paths,
+                        "timestamp": datetime.now().isoformat(),
+                    }
+                    with open(os.path.join(page_folder, "data.json"), "w", encoding="utf-8") as f:
+                        json.dump(data, f, ensure_ascii=False, indent=2)
+                    with open(os.path.join(page_folder, "content.md"), "w", encoding="utf-8") as f:
+                        f.write(f"# {title}\n\n**URL:** {url}\n\n---\n\n{raw_content}")
+                elif getattr(self, "_download_images", False) and getattr(self, "_images_dir", None):
+                    images_downloaded = await self._download_images_batch(
+                        image_urls, self._images_dir, concurrency=5
+                    )
 
                 return {
                     "url": url,
                     "title": title,
                     "content": raw_content,
                     "link": page_links,
+                    "video_links": video_links,
+                    "internal_links": list(internal_links),
+                    "image_urls": image_urls,
+                    "images_downloaded": images_downloaded,
+                    "page_folder": page_folder,
                     "navigation": navigation,
                     "timestamp": datetime.now().isoformat(),
                 }
@@ -231,6 +351,254 @@ class CrawlAIBenhVienScraperSimple:
         except Exception as e:
             logger.debug(f"extract_links_and_videos: {e}")
         return list(links)
+
+    def extract_video_links_only(self, html: str, base_url: str) -> list[str]:
+        """Chỉ trích link video/audio/embed (iframe, video, source, audio) để quản lý riêng."""
+        out = []
+        seen = set()
+        if not html:
+            return out
+        try:
+            for tag in ("video", "source", "audio"):
+                for m in re.finditer(
+                    rf'<{tag}[^>]+src=[\'"]([^\'"]+)[\'"]',
+                    html, re.IGNORECASE
+                ):
+                    u = urljoin(base_url, m.group(1).strip())
+                    if u not in seen:
+                        seen.add(u)
+                        out.append(u)
+            for m in re.finditer(r'<iframe[^>]+src=[\'"]([^\'"]+)[\'"]', html, re.IGNORECASE):
+                u = urljoin(base_url, m.group(1).strip())
+                if u not in seen:
+                    seen.add(u)
+                    out.append(u)
+            for m in re.finditer(r'data-src=[\'"]([^\'"]+)[\'"]', html, re.IGNORECASE):
+                u = urljoin(base_url, m.group(1).strip())
+                if u not in seen:
+                    seen.add(u)
+                    out.append(u)
+        except Exception as e:
+            logger.debug(f"extract_video_links_only: {e}")
+        return out
+
+    def extract_image_urls(self, html: str, base_url: str) -> list[str]:
+        """Trích tất mọi URL ảnh từ HTML (img src, data-src, srcset)."""
+        out = []
+        seen = set()
+        if not html:
+            return out
+        try:
+            # <img src="...">
+            for m in re.finditer(r'<img[^>]+src=[\'"]([^\'"]+)[\'"]', html, re.IGNORECASE):
+                u = urljoin(base_url, m.group(1).strip())
+                if u not in seen and self._is_image_url(u):
+                    seen.add(u)
+                    out.append(u)
+            # data-src, data-lazy-src (lazy load)
+            for m in re.finditer(r'data-(?:lazy-)?src=[\'"]([^\'"]+)[\'"]', html, re.IGNORECASE):
+                u = urljoin(base_url, m.group(1).strip())
+                if u not in seen and self._is_image_url(u):
+                    seen.add(u)
+                    out.append(u)
+            # srcset="url 1x, url2 2x"
+            for m in re.finditer(r'srcset=[\'"]([^\'"]+)[\'"]', html, re.IGNORECASE):
+                for part in m.group(1).split(","):
+                    part = part.strip().split()[0] if part.strip() else ""
+                    if part:
+                        u = urljoin(base_url, part.strip())
+                        if u not in seen and self._is_image_url(u):
+                            seen.add(u)
+                            out.append(u)
+        except Exception as e:
+            logger.debug(f"extract_image_urls: {e}")
+        return out
+
+    def _is_image_url(self, url: str) -> bool:
+        """Kiểm tra URL có phải ảnh (theo extension hoặc pattern)."""
+        u = url.lower().split("?")[0]
+        return any(u.endswith(e) for e in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".bmp", ".ico"))
+
+    async def _download_images_batch(
+        self, image_urls: list[str], save_dir: str, concurrency: int = 5
+    ) -> list[str]:
+        """Tải từng ảnh về save_dir, trả về list đường dẫn file đã lưu (relative hoặc absolute)."""
+        if not image_urls or not save_dir:
+            return []
+        os.makedirs(save_dir, exist_ok=True)
+        semaphore = asyncio.Semaphore(concurrency)
+        saved = []
+
+        async def download_one(img_url: str) -> str | None:
+            async with semaphore:
+                try:
+                    h = hashlib.sha256(img_url.encode()).hexdigest()[:16]
+                    ext = ".jpg"
+                    for e in (".png", ".gif", ".webp", ".jpeg", ".jpg", ".svg"):
+                        if e in img_url.lower().split("?")[0]:
+                            ext = e if e != ".jpeg" else ".jpg"
+                            break
+                    path = os.path.join(save_dir, f"{h}{ext}")
+                    if os.path.isfile(path):
+                        saved.append(path)
+                        return path
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(img_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                            if resp.status != 200:
+                                return None
+                            content = await resp.read()
+                    if len(content) < 100:
+                        return None
+                    with open(path, "wb") as f:
+                        f.write(content)
+                    return path
+                except Exception as e:
+                    logger.debug(f"Download image {img_url[:60]}: {e}")
+                    return None
+
+        tasks = [download_one(u) for u in image_urls]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for r in results:
+            if isinstance(r, str):
+                saved.append(r)
+            elif isinstance(r, Exception):
+                logger.debug(f"Image download error: {r}")
+        return saved
+
+    def _link_type(self, url: str) -> str:
+        """Phân loại link: 'video' (YouTube, Vimeo, file media) hoặc 'page' (trang web)."""
+        if not url:
+            return "unknown"
+        u = url.lower().strip()
+        video_patterns = (
+            "youtube.com", "youtu.be", "vimeo.com", "dailymotion.com",
+            ".mp4", ".webm", ".ogg", ".m3u8", "video/", "embed",
+            "drive.google.com/file", "fb.watch", "facebook.com/watch",
+        )
+        for p in video_patterns:
+            if p in u:
+                return "video"
+        return "page"
+
+    def _collect_all_links_from_content(self) -> set[str]:
+        """Gom tất cả link (link + video_links) từ content_data, trả về set URL unique."""
+        out = set()
+        for item in self.content_data:
+            for key in ("link", "video_links"):
+                val = item.get(key)
+                if isinstance(val, list):
+                    for u in val:
+                        if u and isinstance(u, str) and u.startswith("http"):
+                            out.add(u.strip())
+                elif isinstance(val, str) and val.strip().startswith("http"):
+                    out.add(val.strip())
+        return out
+
+    async def _summarize_one_link(
+        self, url: str, crawler, semaphore
+    ) -> dict | None:
+        """
+        Truy cập link và tóm tắt: type (video/page), title, summary (đoạn ngắn).
+        Video: không fetch, chỉ ghi nhận nguồn (YouTube, Vimeo, ...).
+        Page: fetch lấy title + ~300 ký tự đầu nội dung.
+        """
+        try:
+            link_type = self._link_type(url)
+            if link_type == "video":
+                if "youtube.com" in url.lower() or "youtu.be" in url.lower():
+                    platform = "YouTube"
+                elif "vimeo.com" in url.lower():
+                    platform = "Vimeo"
+                elif "drive.google.com" in url.lower():
+                    platform = "Google Drive"
+                else:
+                    platform = "Video/Media"
+                return {
+                    "url": url,
+                    "type": "video",
+                    "title": platform,
+                    "summary": f"Link video/media: {url[:120]}{'...' if len(url) > 120 else ''}",
+                }
+
+            async with semaphore:
+                result = await crawler.arun(
+                    url=url,
+                    bypass_cache=True,
+                    wait_until="domcontentloaded",
+                )
+            if not result or not getattr(result, "success", False):
+                return {
+                    "url": url,
+                    "type": "page",
+                    "title": "(không lấy được)",
+                    "summary": "Truy cập thất bại hoặc timeout.",
+                }
+            html = getattr(result, "html", "") or ""
+            md = getattr(result, "markdown", "") or ""
+            title = self.extract_title(md) or self.extract_title_from_html(html) or "(không có tiêu đề)"
+            text = (md or html).replace("\n", " ").strip()
+            text = re.sub(r"\s+", " ", text)[:400].strip()
+            if len((md or html)) > 400:
+                text += "..."
+            return {
+                "url": url,
+                "type": "page",
+                "title": self._clean_text(title),
+                "summary": self._clean_text(text) or "(không có nội dung)",
+            }
+        except Exception as e:
+            logger.debug(f"Summarize {url[:60]}: {e}")
+            return {
+                "url": url,
+                "type": "unknown",
+                "title": "",
+                "summary": f"Lỗi: {str(e)[:200]}",
+            }
+
+    async def fetch_and_summarize_links(
+        self,
+        output_file: str = "link_summaries.csv",
+        max_links: int | None = None,
+        concurrency: int = 5,
+    ) -> list[dict]:
+        """
+        Thu thập mọi link từ content_data (link + video_links), truy cập từng link,
+        tóm tắt dữ liệu (video: ghi nguồn; page: title + đoạn nội dung ngắn), lưu CSV.
+        """
+        all_urls = self._collect_all_links_from_content()
+        if not all_urls:
+            logger.warning("Không có link nào trong content_data để tóm tắt.")
+            return []
+        if max_links is not None:
+            all_urls = set(list(all_urls)[: max_links])
+        urls = list(all_urls)
+        logger.info(f"Bắt đầu tóm tắt {len(urls)} link (video + page)...")
+
+        semaphore = asyncio.Semaphore(concurrency)
+        summaries = []
+
+        try:
+            async with AsyncWebCrawler() as crawler:
+                tasks = [
+                    self._summarize_one_link(u, crawler, semaphore)
+                    for u in urls
+                ]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for r in results:
+                    if isinstance(r, Exception):
+                        logger.error(f"Link summary error: {r}")
+                        continue
+                    if r:
+                        summaries.append(r)
+        except Exception as e:
+            logger.error(f"fetch_and_summarize_links: {e}")
+            return summaries
+
+        if summaries:
+            df = pd.DataFrame(summaries)
+            df.to_csv(output_file, index=False, encoding="utf-8-sig")
+            logger.info(f"Đã lưu tóm tắt {len(summaries)} link -> {output_file}")
+        return summaries
 
     def extract_title(self, markdown: str) -> str:
         """Extract title from markdown (# header)"""
@@ -382,6 +750,116 @@ class CrawlAIBenhVienScraperSimple:
 
         return nodes
 
+    def save_nav_only(self, output_dir: str, filename: str = "navigation.json") -> str | None:
+        """Lưu 1 file duy nhất chứa cây nav (id, parent_id, label, level). Các file page không cần lưu nav."""
+        if not self.content_data:
+            return None
+        try:
+            nav_nodes = self._build_nav_tree_and_assign_ids()
+            os.makedirs(output_dir, exist_ok=True)
+            path = os.path.join(output_dir, filename)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(nav_nodes, f, ensure_ascii=False, indent=2)
+            logger.info(f"Saved nav tree ({len(nav_nodes)} nodes) -> {path}")
+            return path
+        except Exception as e:
+            logger.error(f"save_nav_only: {e}")
+            return None
+
+    def export_all_to_one_json_and_insert(
+        self, output_dir: str, json_filename: str = "all_data.json", sql_filename: str = "storage_import.sql"
+    ) -> list[str]:
+        """
+        Gộp toàn bộ data thành 1 file JSON (all_data.json) và sinh file SQL INSERT (storage_import.sql).
+        JSON: [ { "id", "title", "content", "created_at", "video_links", "image_urls" }, ... ]
+        SQL: INSERT vào storage_data, storage_video, storage_image.
+        """
+        if not self.content_data:
+            logger.warning("No content_data to export")
+            return []
+        os.makedirs(output_dir, exist_ok=True)
+        written = []
+
+        # Gộp thành list 1 page = 1 object (có id, video_links, image_urls)
+        rows_data = []
+        rows_video = []
+        rows_image = []
+
+        for item in self.content_data:
+            storage_id = uuid.uuid4()
+            title = self._clean_text(item.get("title", "")) or "(no title)"
+            content = item.get("content", "") or ""
+            created_at = item.get("timestamp", "") or datetime.now().isoformat()
+            link = (item.get("url") or "").strip()[:2000]  # đường dẫn trang (storage_data.link)
+            video_links = [v.strip()[:500] for v in (item.get("video_links") or []) if v and isinstance(v, str) and v.strip()]
+            image_urls = [img.strip()[:500] for img in (item.get("image_urls") or []) if img and isinstance(img, str) and img.strip()]
+
+            rows_data.append({
+                "id": str(storage_id),
+                "title": title,
+                "content": content,
+                "created_at": created_at,
+                "link": link,
+                "video_links": video_links,
+                "image_urls": image_urls,
+            })
+            for v in video_links:
+                rows_video.append({
+                    "id": str(uuid.uuid4()),
+                    "storage_id": str(storage_id),
+                    "video_url": v,
+                })
+            for u in image_urls:
+                rows_image.append({
+                    "id": str(uuid.uuid4()),
+                    "storage_id": str(storage_id),
+                    "image_url": u,
+                })
+
+        # 1 file JSON gộp tất cả (để đọc / backup / insert sau)
+        json_path = os.path.join(output_dir, json_filename)
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(rows_data, f, ensure_ascii=False, indent=2)
+        written.append(json_path)
+        logger.info(f"Saved 1 file JSON: {len(rows_data)} pages -> {json_path}")
+
+        # SQL INSERT từ cùng dữ liệu
+        def esc(s: str) -> str:
+            return (s or "").replace("\\", "\\\\").replace("'", "''")
+
+        sql_path = os.path.join(output_dir, sql_filename)
+        with open(sql_path, "w", encoding="utf-8") as f:
+            f.write("-- Generated from all_data.json\n")
+            f.write("-- storage_data\n")
+            for r in rows_data:
+                c = esc(r["content"])[:50000]
+                t = esc(r["title"])
+                lnk = esc(r.get("link", ""))[:2000]
+                f.write(f"INSERT INTO storage_data (id, title, content, created_at, link) VALUES ('{r['id']}', '{t}', '{c}', '{r['created_at']}', '{lnk}');\n")
+            f.write("\n-- storage_video\n")
+            for r in rows_video:
+                v = esc(r["video_url"])
+                f.write(f"INSERT INTO storage_video (id, storage_id, video_url) VALUES ('{r['id']}', '{r['storage_id']}', '{v}');\n")
+            f.write("\n-- storage_image\n")
+            for r in rows_image:
+                u = esc(r["image_url"])
+                f.write(f"INSERT INTO storage_image (id, storage_id, image_url) VALUES ('{r['id']}', '{r['storage_id']}', '{u}');\n")
+        written.append(sql_path)
+        logger.info(f"Saved SQL INSERT: {len(rows_data)} data, {len(rows_video)} video, {len(rows_image)} image -> {sql_path}")
+
+        return written
+
+    def export_for_storage_tables(self, output_dir: str) -> list[str]:
+        """
+        Gộp 1 file JSON + sinh SQL INSERT. Gọi export_all_to_one_json_and_insert.
+        Giữ tên cũ để tương thích.
+        """
+        return self.export_all_to_one_json_and_insert(
+            output_dir,
+            json_filename="all_data.json",
+            sql_filename="storage_import.sql",
+        )
+
     def save_as_markdown(self, filename: str = "benhvien_content_detailed.md"):
         """Save extracted content as markdown with title + content format"""
         if not self.content_data:
@@ -395,11 +873,6 @@ class CrawlAIBenhVienScraperSimple:
                     f.write(f"# {item['title']}\n\n")
                     f.write(f"**Navigation:**\n{item['navigation']}\n\n")
                     f.write(f"**URL:** {item['url']}\n")
-                    links = item.get("link", [])
-                    if links:
-                        f.write(f"**Link (video/links):**\n")
-                        for L in links:
-                            f.write(f"  - {L}\n")
                     f.write(f"**Timestamp:** {item['timestamp']}\n\n")
                     f.write(f"---\n\n")
                     f.write(f"{item['content']}\n\n")
@@ -431,15 +904,13 @@ class CrawlAIBenhVienScraperSimple:
         try:
             rows = []
             for item in self.content_data:
-                links = item.get("link", [])
-                link_str = " | ".join(links) if isinstance(links, list) else str(links)
                 rows.append({
-                    "title": item["title"],
-                    "url": item["url"],
-                    "content": item["content"],
-                    "link": link_str,
-                    "navigation": item["navigation"],
-                    "timestamp": item["timestamp"],
+                    "title": self._clean_text(item.get("title", "")),
+                    "url": (item.get("url", "") or "").strip(),
+                    "content": self._clean_content(item.get("content", "")),
+                    "video_links": self._links_to_column(item.get("video_links", [])),
+                    "navigation": self._clean_text(item.get("navigation", "")),
+                    "timestamp": item.get("timestamp", ""),
                 })
             df = pd.DataFrame(rows)
             df.to_csv(filename, index=False, encoding="utf-8-sig")
@@ -451,7 +922,7 @@ class CrawlAIBenhVienScraperSimple:
         """
         Lưu Excel nhiều sheet:
         - Sheet Navigation: id, parent_id, label, level (cây nav để quản lý).
-        - Sheet Content: title, url, nav_id, content_preview, full_content, link, timestamp.
+        - Sheet Content: title, url, nav_id, content_preview, full_content, video_links, timestamp.
         """
         if not self.content_data:
             logger.warning("No content to save")
@@ -466,21 +937,16 @@ class CrawlAIBenhVienScraperSimple:
 
             content_rows = []
             for item in self.content_data:
-                links = item.get("link", [])
-                link_str = "\n".join(links) if isinstance(links, list) else str(links)
+                raw = item.get("content", "")
                 content_rows.append({
-                    "title": item["title"],
-                    "url": item["url"],
+                    "title": self._clean_text(item.get("title", "")),
+                    "url": (item.get("url", "") or "").strip(),
                     "nav_id": item.get("nav_id", ""),
-                    "navigation": item.get("navigation", ""),
-                    "link": link_str,
-                    "content_preview": (
-                        item["content"][:500] + "..."
-                        if len(item["content"]) > 500
-                        else item["content"]
-                    ),
-                    "full_content": item["content"],
-                    "timestamp": item["timestamp"],
+                    "navigation": self._clean_text(item.get("navigation", "")),
+                    "video_links": self._links_to_column(item.get("video_links", [])),
+                    "content_preview": self._clean_content((raw[:500] + "...") if len(raw) > 500 else raw),
+                    "full_content": self._clean_content(raw),
+                    "timestamp": item.get("timestamp", ""),
                 })
             df_content = pd.DataFrame(content_rows)
 
@@ -493,6 +959,186 @@ class CrawlAIBenhVienScraperSimple:
             )
         except Exception as e:
             logger.error(f"Error saving XLSX: {e}")
+
+    def _slug(self, label: str) -> str:
+        """Tên file an toàn từ label (bỏ ký tự đặc biệt)."""
+        s = re.sub(r"[^\w\s-]", "", label)
+        s = re.sub(r"[-\s]+", "_", s).strip("_")
+        return s or "unnamed"
+
+    def _page_slug(self, url: str, title: str = "") -> str:
+        """Tên thư mục riêng cho từng page (từ URL path + title + hash để tránh trùng)."""
+        p = urlparse(url)
+        path = (p.path or "/").strip("/")
+        path_slug = re.sub(r"[^\w\-/]", "_", path)
+        path_slug = re.sub(r"_+", "_", path_slug).strip("_") or "page"
+        if len(path_slug) > 50:
+            path_slug = path_slug[:50]
+        title_slug = self._slug(title)[:30] if title else ""
+        unique = hashlib.sha256(url.encode()).hexdigest()[:8]
+        if title_slug:
+            return f"{path_slug}_{title_slug}_{unique}"
+        return f"{path_slug}_{unique}"
+
+    def _clean_text(self, s: str) -> str:
+        """Clean chuỗi: bỏ khoảng trắng thừa, decode HTML entity, strip."""
+        if not s or not isinstance(s, str):
+            return ""
+        s = s.strip()
+        s = re.sub(r"\s+", " ", s)
+        s = s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"')
+        return s.strip()
+
+    def _clean_content(self, s: str) -> str:
+        """Clean nội dung: gộp dòng trống liên tiếp, trim từng dòng."""
+        if not s or not isinstance(s, str):
+            return ""
+        lines = [ln.strip() for ln in s.splitlines()]
+        out = []
+        prev_blank = False
+        for ln in lines:
+            is_blank = not ln
+            if is_blank and prev_blank:
+                continue
+            prev_blank = is_blank
+            out.append(ln)
+        return "\n".join(out).strip()
+
+    def _strip_urls_from_content(self, text: str) -> str:
+        """Bỏ URL khỏi content (link/video/ảnh đã lưu riêng cột, content chỉ giữ chữ)."""
+        if not text or not isinstance(text, str):
+            return ""
+        # Markdown link [text](url) -> chỉ giữ text
+        text = re.sub(r'\[([^\]]*)\]\(https?://[^\)]+\)', r'\1', text)
+        # URL trần: https?://...
+        text = re.sub(r'https?://\S+', '', text)
+        # Gộp nhiều space trên cùng dòng (giữ xuống dòng)
+        text = re.sub(r'[^\S\n]+', ' ', text).strip()
+        return text
+
+    def _links_to_column(self, links: list | str) -> str:
+        """Chuyển list link thành một cột: mỗi link một dòng (dễ quản lý trong CSV/Excel)."""
+        if isinstance(links, str):
+            return links.strip() if links else ""
+        if not links:
+            return ""
+        return "\n".join(str(u).strip() for u in links if u)
+
+    def save_csv_by_label(self, output_dir: str = "csv_by_label") -> list[str]:
+        """
+        Chia dữ liệu đã crawl theo label → mỗi label một file CSV riêng.
+        Cần đã gọi load_links_from_markdown() và crawl xong (content_data + _label_to_urls).
+        Trả về list đường dẫn file đã ghi.
+        """
+        if not getattr(self, "_label_to_urls", None) or not self._label_to_urls:
+            logger.warning("No _label_to_urls (chỉ có khi đọc từ file * [Label](URL))")
+            return []
+        url_to_item = {item["url"]: item for item in self.content_data}
+
+        os.makedirs(output_dir, exist_ok=True)
+        written = []
+        for label, urls in self._label_to_urls.items():
+            rows = []
+            for url in urls:
+                if url in url_to_item:
+                    item = url_to_item[url]
+                    rows.append({
+                        "label": self._clean_text(label),
+                        "title": self._clean_text(item.get("title", "")),
+                        "url": (item.get("url", "") or "").strip(),
+                        "nav_id": item.get("nav_id", ""),
+                        "content": self._clean_content(item.get("content", "")),
+                        "video_links": self._links_to_column(item.get("video_links", [])),
+                        "navigation": self._clean_text(item.get("navigation", "")),
+                        "timestamp": item.get("timestamp", ""),
+                    })
+            if not rows:
+                logger.debug(f"Label '{label}' không có dữ liệu crawl (URL chưa crawl được)")
+                continue
+            df = pd.DataFrame(rows)
+            safe_name = self._slug(label)
+            path = os.path.join(output_dir, f"{safe_name}.csv")
+            df.to_csv(path, index=False, encoding="utf-8-sig")
+            written.append(path)
+            logger.info(f"  -> {path} ({len(rows)} rows)")
+        logger.info(f"Saved {len(written)} CSV files in {output_dir}/")
+        return written
+
+    def save_csv_by_nav(self, output_dir: str = "csv_by_nav") -> list[str]:
+        """
+        Chia dữ liệu đã crawl theo navigation (nav_id) → mỗi nav một file CSV nhỏ để quản lý.
+        Cần đã crawl xong và có content_data. Sẽ gọi _build_nav_tree_and_assign_ids().
+        """
+        if not self.content_data:
+            logger.warning("No content to save")
+            return []
+        try:
+            nav_nodes = self._build_nav_tree_and_assign_ids()
+            id_to_label = {n["id"]: n["label"] for n in nav_nodes}
+        except Exception as e:
+            logger.error(f"Build nav tree: {e}")
+            return []
+
+        by_nav: dict[int, list[dict]] = {}
+        for item in self.content_data:
+            nid = item.get("nav_id") or 1
+            by_nav.setdefault(nid, []).append(item)
+
+        os.makedirs(output_dir, exist_ok=True)
+        written = []
+        for nid, items in by_nav.items():
+            label = id_to_label.get(nid, f"nav_{nid}")
+            rows = []
+            for item in items:
+                rows.append({
+                    "title": self._clean_text(item.get("title", "")),
+                    "url": (item.get("url", "") or "").strip(),
+                    "page_folder": item.get("page_folder", ""),
+                    "nav_id": nid,
+                    "content": self._clean_content(item.get("content", "")),
+                    "video_links": self._links_to_column(item.get("video_links", [])),
+                    "image_urls": self._links_to_column(item.get("image_urls", [])),
+                    "timestamp": item.get("timestamp", ""),
+                })
+            safe = self._slug(label)
+            path = os.path.join(output_dir, f"{safe}.csv")
+            pd.DataFrame(rows).to_csv(path, index=False, encoding="utf-8-sig")
+            written.append(path)
+            logger.info(f"  -> {path} ({len(rows)} rows)")
+        logger.info(f"Saved {len(written)} CSV files (theo nav) in {output_dir}/")
+        return written
+
+    def save_all_pages_one_row(self, output_dir: str, filename: str = "all_pages.csv") -> str | None:
+        """
+        Lưu 1 file CSV: 1 page = 1 dòng (mỗi trang crawl là đúng 1 dòng data).
+        Cột: title, url, nav_id, page_folder, content, video_links, image_urls, timestamp.
+        """
+        if not self.content_data:
+            return None
+        try:
+            nav_nodes = self._build_nav_tree_and_assign_ids()
+            id_to_label = {n["id"]: n["label"] for n in nav_nodes}
+        except Exception:
+            id_to_label = {}
+
+        rows = []
+        for item in self.content_data:
+            nid = item.get("nav_id") or 1
+            rows.append({
+                "title": self._clean_text(item.get("title", "")),
+                "url": (item.get("url", "") or "").strip(),
+                "nav_id": nid,
+                "page_folder": item.get("page_folder", ""),
+                "content": self._clean_content(item.get("content", "")),
+                "video_links": self._links_to_column(item.get("video_links", [])),
+                "image_urls": self._links_to_column(item.get("image_urls", [])),
+                "timestamp": item.get("timestamp", ""),
+            })
+        os.makedirs(output_dir, exist_ok=True)
+        path = os.path.join(output_dir, filename)
+        pd.DataFrame(rows).to_csv(path, index=False, encoding="utf-8-sig")
+        logger.info(f"Saved 1 page = 1 row: {len(rows)} rows -> {path}")
+        return path
 
     async def run(self):
         """Run the content fetcher (asyncio song song, giới hạn bởi concurrency)."""
@@ -516,7 +1162,7 @@ class CrawlAIBenhVienScraperSimple:
             # Tạo file CSV + JSONL ngay, ghi header CSV
             self._csv_file = open(csv_path, "w", encoding="utf-8-sig", newline="")
             self._csv_writer = csv.writer(self._csv_file)
-            self._csv_writer.writerow(["title", "url", "nav_id", "content", "link", "navigation", "timestamp"])
+            self._csv_writer.writerow(["title", "url", "nav_id", "content", "video_links", "image_urls", "timestamp"])
             self._csv_file.flush()
             self._jsonl_file = open(jsonl_path, "w", encoding="utf-8")
 
@@ -577,20 +1223,196 @@ class CrawlAIBenhVienScraperSimple:
         """Check if URL belongs to the same domain"""
         try:
             parsed = urlparse(url)
-            return self.base_domain in parsed.netloc
+            return (self.base_domain or "") in (parsed.netloc or "")
         except Exception:
             return False
 
+    async def run_from_seed_url(
+        self,
+        seed_url: str,
+        output_dir: str = "csv_by_nav",
+        max_pages: int | None = 500,
+        concurrency: int = 10,
+        summarize_links: bool = True,
+        max_summary_links: int | None = 300,
+        download_images: bool = False,
+    ):
+        """
+        Vào web từ URL gốc, crawl toàn bộ trang (kể cả trang con), trích raw_data + link video/ảnh.
+        Ảnh và video chỉ lưu URL vào cột riêng (image_urls, video_links), không tải file.
+
+        - seed_url: URL bắt đầu (vd: https://benhvienanbinh.vn/)
+        - download_images: False (mặc định) = chỉ lưu URL ảnh/video vào cột; True = tải ảnh về folder
+        - summarize_links: truy cập từng link (video/page) và tóm tắt -> link_summaries.csv
+        """
+        self.base_domain = self._domain_from_url(seed_url)
+        if not self.base_domain:
+            logger.error("Không xác định được domain từ seed URL")
+            return
+        self.home_url = self.normalize_path(seed_url)
+        self.visited_urls = set()
+        self.content_data = []
+        self._nav_key_to_id = {}
+        self._nav_next_id = 2
+        # Mỗi page một folder riêng: output_dir/pages/{page_slug}/ (data.json, content.md, images/)
+        self._pages_dir = os.path.join(output_dir, "pages")
+        self._images_dir = None  # không dùng thư mục ảnh chung khi đã dùng folder từng page
+        self._download_images = bool(download_images)
+
+        to_crawl = {seed_url}
+        visited_norm = set()
+        self._semaphore = asyncio.Semaphore(concurrency or self.concurrency)
+
+        try:
+            async with AsyncWebCrawler() as crawler:
+                self.crawler = crawler
+
+                while to_crawl and (max_pages is None or len(self.content_data) < max_pages):
+                    batch = []
+                    batch_norm = set()
+                    for u in list(to_crawl):
+                        u_n = self.normalize_path(u)
+                        if u_n in visited_norm or u_n in batch_norm:
+                            continue
+                        batch_norm.add(u_n)
+                        batch.append(u)
+                        if len(batch) >= (concurrency or 10):
+                            break
+                    if not batch:
+                        break
+                    for u in batch:
+                        visited_norm.add(self.normalize_path(u))
+                    to_crawl -= set(batch)
+
+                    tasks = [self._fetch_one_for_seed(u) for u in batch]
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                    for r in results:
+                        if isinstance(r, Exception):
+                            logger.error(f"Task error: {r}")
+                            continue
+                        if r:
+                            self._assign_nav_id_incremental(r)
+                            self.content_data.append(r)
+                            for u in r.get("internal_links") or []:
+                                if not u or not self.is_same_domain(u):
+                                    continue
+                                u_norm = self.normalize_path(u)
+                                if u_norm not in visited_norm:
+                                    to_crawl.add(u)
+
+            written = self.save_csv_by_nav(output_dir=output_dir)
+            one_row_path = self.save_all_pages_one_row(output_dir, "all_pages.csv")
+            if one_row_path:
+                written.append(one_row_path)
+            nav_path = self.save_nav_only(output_dir, "navigation.json")
+            if nav_path:
+                written.append(nav_path)
+            # Định dạng sẵn cho 3 bảng: storage_data, storage_video, storage_image
+            storage_files = self.export_for_storage_tables(output_dir)
+            written.extend(storage_files)
+            if summarize_links and self.content_data:
+                summary_path = os.path.join(output_dir, "link_summaries.csv")
+                await self.fetch_and_summarize_links(
+                    output_file=summary_path,
+                    max_links=max_summary_links,
+                    concurrency=5,
+                )
+                written.append(summary_path)
+            print(f"\n=== Crawl toàn site từ URL gốc ===")
+            print(f"Seed: {seed_url}")
+            print(f"Domain: {self.base_domain}")
+            print(f"Tổng trang đã crawl: {len(self.content_data)}")
+            print(f"Đã chia thành {len(written)} file trong: {output_dir}/")
+            print(f"  Import DB: storage_data.csv, storage_video.csv, storage_image.csv, storage_import.sql")
+            if getattr(self, "_pages_dir", None) and os.path.isdir(self._pages_dir):
+                n_pages = len([d for d in os.listdir(self._pages_dir) if os.path.isdir(os.path.join(self._pages_dir, d))])
+                print(f"  Data + ảnh từng page: {n_pages} folder trong {self._pages_dir}/ (mỗi folder: data.json, content.md, images/)")
+            for p in written[:25]:
+                print(f"  - {p}")
+            if len(written) > 25:
+                print(f"  ... và {len(written) - 25} file khác")
+        except Exception as e:
+            logger.error(f"Fatal error: {e}")
+
+    async def _fetch_one_for_seed(self, url: str) -> dict | None:
+        """Crawl 1 URL (dùng trong run_from_seed_url), không ghi file stream."""
+        if self.normalize_path(url) in self.visited_urls:
+            return None
+        self.visited_urls.add(self.normalize_path(url))
+        async with self._semaphore:
+            logger.info(f"Fetching: {url} (đã crawl {len(self.content_data)} trang)")
+            return await self._do_fetch(url, title_from_csv=None)
+
+    async def run_from_links_file(
+        self,
+        links_file: str,
+        output_dir: str = "csv_by_label",
+        concurrency: int = 10,
+    ):
+        """
+        Đọc file link dạng * [Label](URL), crawl từng URL, chia thành các CSV riêng theo label.
+        Ví dụ: links.txt chứa
+          * [Quá trình hình thành & phát triển](https://...)
+          * [Ban Giám đốc](https://...)
+        → crawl xong sẽ có csv_by_label/Qua_trinh_hinh_thanh_phat_trien.csv, Ban_Giam_doc.csv, ...
+        """
+        if not self.load_links_from_markdown(links_file):
+            return
+
+        to_crawl = [
+            (url, label)
+            for url, label in self.urls_to_process
+            if self.is_same_domain(url)
+        ]
+        if not to_crawl:
+            logger.warning("No URLs to crawl (same domain).")
+            return
+
+        self._semaphore = asyncio.Semaphore(concurrency or self.concurrency)
+
+        try:
+            async with AsyncWebCrawler() as crawler:
+                self.crawler = crawler
+                tasks = [
+                    self._fetch_one(url, title_from_csv=label)
+                    for url, label in to_crawl
+                ]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for r in results:
+                    if isinstance(r, Exception):
+                        logger.error(f"Task error: {r}")
+
+            written = self.save_csv_by_label(output_dir=output_dir)
+            print(f"\n=== Crawl từ link dạng * [Label](URL) ===")
+            print(f"File link: {links_file}")
+            print(f"Total pages: {len(self.content_data)}")
+            print(f"Đã chia thành {len(written)} CSV trong thư mục: {output_dir}/")
+            for p in written:
+                print(f"  - {p}")
+        except Exception as e:
+            logger.error(f"Fatal error: {e}")
+
 
 async def main():
-    # Một file: input_csv="benhvien_data.csv"
-    # Nhiều file cùng lúc: input_csv=["file1.csv", "file2.csv", "file3.csv"]
-    scraper = CrawlAIBenhVienScraperSimple(
-        input_csv="benhvien_data.csv",  # hoặc ["a.csv", "b.csv", "c.csv"]
-        max_pages=None,
+    # Chế độ 1: Vào web từ URL gốc → crawl toàn bộ site (trang con) → chia CSV theo nav + trích video
+    scraper = CrawlAIBenhVienScraperSimple(max_pages=None, concurrency=10)
+    await scraper.run_from_seed_url(
+        seed_url="https://benhvienanbinh.vn/",  # URL web cần crawl
+        output_dir="csv_by_nav",
+        max_pages=500,   # None = không giới hạn
         concurrency=10,
+        summarize_links=True,      # Truy cập từng link (video/page) và tóm tắt
+        max_summary_links=300,     # Giới hạn số link tóm tắt (None = tất cả)
+        download_images=False,    # Chỉ lưu URL ảnh/video vào cột (True = tải ảnh về folder)
     )
-    await scraper.run()
+
+    # Chế độ 2: CSV có cột link/url (như cũ)
+    # scraper = CrawlAIBenhVienScraperSimple(input_csv="benhvien_data.csv", max_pages=None, concurrency=10)
+    # await scraper.run()
+
+    # Chế độ 3: File link dạng * [Label](URL) → crawl và chia mỗi label một CSV riêng
+    # await scraper.run_from_links_file(links_file="links.txt", output_dir="csv_by_label")
 
 
 if __name__ == "__main__":

@@ -1,7 +1,11 @@
 # Minimal dependencies for the demo
 scrapling
 pandas
-
+psycopg2
 # For crawl4ai-based scraper
 crawl4ai
+aiohttp
+
+# PostgreSQL (để insert từ all_data.json)
+psycopg2-binary
 # openai  # Optional: for LLM extraction in crawl4ai
