@@ -9,3 +9,6 @@ aiohttp
 # PostgreSQL (để insert từ all_data.json)
 psycopg2-binary
 # openai  # Optional: for LLM extraction in crawl4ai
+
+# Postgres connection test (scrapling_demo/test.py)
+psycopg[binary]
