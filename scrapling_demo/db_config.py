@@ -51,22 +51,100 @@ CREATE TABLE IF NOT EXISTS storage_data (
     id UUID PRIMARY KEY,
     title VARCHAR(255),
     content TEXT,
-    link VARCHAR(255),
+    link TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS storage_video (
     id UUID PRIMARY KEY,
     storage_id UUID REFERENCES storage_data(id) ON DELETE CASCADE,
-    video_url VARCHAR(500) NOT NULL
+    video_url TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS storage_image (
     id UUID PRIMARY KEY,
     storage_id UUID REFERENCES storage_data(id) ON DELETE CASCADE,
-    image_url VARCHAR(500) NOT NULL
+    image_url TEXT NOT NULL
 );
 """
+
+
+def migrate_url_columns_to_text() -> None:
+    """
+    Nâng giới hạn URL để tránh bị cắt (URL dài có token sẽ hỏng nếu bị truncate).
+    An toàn khi chạy nhiều lần.
+    """
+    conn = get_connection()
+    cur = None
+    try:
+        cur = conn.cursor()
+        cur.execute("ALTER TABLE storage_data ALTER COLUMN link TYPE TEXT;")
+        cur.execute("ALTER TABLE storage_video ALTER COLUMN video_url TYPE TEXT;")
+        cur.execute("ALTER TABLE storage_image ALTER COLUMN image_url TYPE TEXT;")
+        conn.commit()
+        print("Đã migrate link/video_url/image_url sang TEXT.")
+    finally:
+        if cur:
+            cur.close()
+        conn.close()
+
+
+def migrate_youtube_embed_urls_to_watch() -> None:
+    """
+    Chuyển URL YouTube dạng /embed/... trong storage_video sang dạng watch/playlist,
+    đồng thời decode '&amp;' -> '&' và '//' -> 'https://'.
+    """
+    conn = get_connection()
+    cur = None
+    try:
+        cur = conn.cursor()
+
+        # Decode HTML entity first
+        cur.execute(
+            """
+            UPDATE storage_video
+            SET video_url = REPLACE(video_url, '&amp;', '&')
+            WHERE video_url LIKE '%&amp;%';
+            """
+        )
+
+        # Scheme-relative -> https
+        cur.execute(
+            """
+            UPDATE storage_video
+            SET video_url = 'https:' || video_url
+            WHERE video_url LIKE '//%';
+            """
+        )
+
+        # videoseries -> playlist?list=
+        cur.execute(
+            """
+            UPDATE storage_video
+            SET video_url = 'https://www.youtube.com/playlist?list=' ||
+                regexp_replace(video_url, '.*[\\?&]list=([^&]+).*', '\\1')
+            WHERE video_url ~* 'youtube(\\-nocookie)?\\.com/embed/videoseries'
+              AND video_url ~* 'list=';
+            """
+        )
+
+        # /embed/<id> -> /watch?v=<id>
+        cur.execute(
+            """
+            UPDATE storage_video
+            SET video_url = 'https://www.youtube.com/watch?v=' ||
+                regexp_replace(video_url, '.*/embed/([^\\?&#/]+).*', '\\1')
+            WHERE video_url ~* 'youtube(\\-nocookie)?\\.com/embed/'
+              AND video_url !~* '/embed/videoseries';
+            """
+        )
+
+        conn.commit()
+        print("Đã migrate URL YouTube embed -> watch/playlist trong storage_video.")
+    finally:
+        if cur:
+            cur.close()
+        conn.close()
 
 # Server DB
 DB_HOST = "192.168.1.66"
@@ -116,6 +194,13 @@ if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "create":
         create_tables_if_not_exist()
+    elif len(sys.argv) > 1 and sys.argv[1] == "migrate":
+        create_tables_if_not_exist()
+        migrate_url_columns_to_text()
+    elif len(sys.argv) > 1 and sys.argv[1] == "migrate_youtube":
+        create_tables_if_not_exist()
+        migrate_url_columns_to_text()
+        migrate_youtube_embed_urls_to_watch()
     else:
         conn = get_connection()
         print("Kết nối DB thành công.")

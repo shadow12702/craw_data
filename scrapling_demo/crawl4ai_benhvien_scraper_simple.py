@@ -7,13 +7,423 @@ import re
 import os
 import uuid
 import pandas as pd
+import importlib.util
+from html.parser import HTMLParser
+from html import unescape
 from datetime import datetime
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 from crawl4ai import AsyncWebCrawler
 import aiohttp
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _now_iso() -> str:
+    return datetime.now().isoformat()
+
+
+def canonicalize_video_url(url: str) -> str:
+    """
+    Chuẩn hóa URL video để dễ click từ DB.
+    Đặc biệt: chuyển YouTube embed (/embed/..., /embed/videoseries) -> watch/playlist.
+    """
+    u = (url or "").strip()
+    if not u:
+        return ""
+    if u.startswith("//"):
+        u = "https:" + u
+    try:
+        p = urlparse(u)
+    except Exception:
+        return u
+
+    host = (p.netloc or "").lower()
+    path = p.path or ""
+
+    def _watch_url(video_id: str, query: str) -> str:
+        q = parse_qs(query or "", keep_blank_values=False)
+        for k in ("feature", "si"):
+            q.pop(k, None)
+        params: list[tuple[str, str]] = [("v", video_id)]
+        for k, vals in q.items():
+            for v in vals:
+                if v is not None and v != "":
+                    params.append((k, v))
+        return "https://www.youtube.com/watch?" + urlencode(params, doseq=True)
+
+    if host == "youtu.be":
+        vid = path.strip("/").split("/")[0] if path else ""
+        return _watch_url(vid, p.query) if vid else u
+
+    if host.endswith("youtube.com") or host.endswith("youtube-nocookie.com"):
+        if path.startswith("/embed/videoseries"):
+            q = parse_qs(p.query or "")
+            lst = (q.get("list") or [None])[0]
+            if lst:
+                return f"https://www.youtube.com/playlist?list={lst}"
+            return u
+        m = re.match(r"^/embed/([^/?#]+)", path or "")
+        if m:
+            return _watch_url(m.group(1), p.query)
+
+    return u
+
+
+class CrawlState:
+    """
+    Append-only event log để hỗ trợ resume khi đang chạy bị stop.
+
+    Lưu tại: <output_root>/state/<events_filename>
+    """
+
+    def __init__(self, output_root: str, events_filename: str = "events_db.jsonl"):
+        self.state_dir = os.path.join(output_root or ".", "state")
+        os.makedirs(self.state_dir, exist_ok=True)
+        self.events_path = os.path.join(self.state_dir, events_filename)
+        self._lock = asyncio.Lock()
+
+    async def record(self, event_type: str, url: str, ok: bool | None = None, error: str | None = None) -> None:
+        rec: dict[str, object] = {"ts": _now_iso(), "type": event_type, "url": url}
+        if ok is not None:
+            rec["ok"] = bool(ok)
+        if error:
+            rec["error"] = str(error)[:500]
+        line = json.dumps(rec, ensure_ascii=False)
+        async with self._lock:
+            with open(self.events_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+
+    def load(self) -> tuple[set[str], set[str], set[str], set[str]]:
+        """
+        Returns (enqueued, started, done_ok, done_failed)
+        """
+        enqueued: set[str] = set()
+        started: set[str] = set()
+        done_ok: set[str] = set()
+        done_failed: set[str] = set()
+
+        if not os.path.exists(self.events_path):
+            return enqueued, started, done_ok, done_failed
+
+        try:
+            with open(self.events_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    t = rec.get("type")
+                    u = rec.get("url")
+                    if not isinstance(u, str) or not u:
+                        continue
+                    if t == "enqueue":
+                        enqueued.add(u)
+                    elif t == "start":
+                        started.add(u)
+                    elif t == "done":
+                        if rec.get("ok") is True:
+                            done_ok.add(u)
+                        else:
+                            done_failed.add(u)
+        except Exception:
+            return enqueued, started, done_ok, done_failed
+
+        return enqueued, started, done_ok, done_failed
+
+
+class _ContentTextExtractor(HTMLParser):
+    """
+    Trích text từ HTML, bỏ phần nằm trong element có class 'header-wrapper'
+    và bỏ cả các vùng menu/nav (header/nav/footer/aside) để tránh menu bị lẫn vào content.
+    Không dùng bs4 để tránh thêm dependency.
+    """
+
+    _BLOCK_TAGS = {
+        "p", "br", "div", "section", "article", "main",
+        "h1", "h2", "h3", "h4", "h5", "h6",
+        "ul", "ol", "li",
+        "table", "thead", "tbody", "tr", "td", "th",
+        "blockquote",
+    }
+
+    def __init__(self, exclude_class_contains: set[str] | None = None, *, skip_nav_menu: bool = True):
+        super().__init__(convert_charrefs=False)
+        self.exclude_class_contains = exclude_class_contains or {"header-wrapper"}
+        self.skip_nav_menu = bool(skip_nav_menu)
+        self._exclude_depth = 0
+        self._skip_depth = 0  # script/style/noscript + nav/menu areas
+        self._chunks: list[str] = []
+
+    def _attrs_dict(self, attrs):
+        try:
+            return {k: v for k, v in (attrs or [])}
+        except Exception:
+            return {}
+
+    def _is_excluded_start(self, tag: str, attrs) -> bool:
+        if tag.lower() != "div":
+            return False
+        ad = self._attrs_dict(attrs)
+        cls = ad.get("class") or ""
+        if isinstance(cls, (list, tuple)):
+            cls = " ".join(str(x) for x in cls if x)
+        cls = str(cls)
+        return any(x in cls for x in self.exclude_class_contains)
+
+    def _is_nav_menu_start(self, tag: str, attrs) -> bool:
+        t = (tag or "").lower()
+        if t in ("nav", "header", "footer", "aside"):
+            return True
+        ad = self._attrs_dict(attrs)
+        cls = ad.get("class") or ""
+        if isinstance(cls, (list, tuple)):
+            cls = " ".join(str(x) for x in cls if x)
+        cls = str(cls).lower()
+        # heuristic: các wrapper menu phổ biến
+        if any(k in cls for k in ("menu", "navbar", "nav", "site-header", "site-footer", "header", "footer")):
+            return True
+        return False
+
+    def handle_starttag(self, tag, attrs):
+        tag = (tag or "").lower()
+        if self._exclude_depth > 0:
+            self._exclude_depth += 1
+            return
+        if self._skip_depth > 0:
+            self._skip_depth += 1
+            return
+        if tag in ("script", "style", "noscript"):
+            self._skip_depth = 1
+            return
+        if self.skip_nav_menu and self._is_nav_menu_start(tag, attrs):
+            self._skip_depth = 1
+            return
+        if self._is_excluded_start(tag, attrs):
+            self._exclude_depth = 1
+            return
+        if tag in self._BLOCK_TAGS:
+            self._chunks.append("\n")
+
+    def handle_endtag(self, tag):
+        if self._exclude_depth > 0:
+            self._exclude_depth -= 1
+            return
+        if self._skip_depth > 0:
+            self._skip_depth -= 1
+            return
+        tag = (tag or "").lower()
+        if tag in self._BLOCK_TAGS:
+            self._chunks.append("\n")
+
+    def handle_data(self, data):
+        if self._exclude_depth > 0 or self._skip_depth > 0:
+            return
+        if data:
+            self._chunks.append(data)
+
+    def handle_entityref(self, name):
+        if self._exclude_depth > 0 or self._skip_depth > 0:
+            return
+        self._chunks.append(f"&{name};")
+
+    def handle_charref(self, name):
+        if self._exclude_depth > 0 or self._skip_depth > 0:
+            return
+        self._chunks.append(f"&#{name};")
+
+    def text(self) -> str:
+        return unescape("".join(self._chunks))
+
+
+class _ElementInnerHTMLExtractor(HTMLParser):
+    """Lấy inner HTML của 1 element mục tiêu (theo tag/id/class)."""
+
+    def __init__(
+        self,
+        *,
+        tag: str,
+        required_classes: set[str] | None = None,
+        id_equals: str | None = None,
+    ):
+        super().__init__(convert_charrefs=False)
+        self.tag = (tag or "").lower()
+        self.required_classes = required_classes or set()
+        self.id_equals = id_equals
+        self._depth = 0
+        self._capturing = False
+        self._chunks: list[str] = []
+
+    @staticmethod
+    def _attrs_dict(attrs) -> dict[str, str]:
+        try:
+            return {k.lower(): (v or "") for k, v in (attrs or []) if k}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _class_has_all(cls: str, required: set[str]) -> bool:
+        parts = {p for p in re.split(r"\s+", (cls or "").strip()) if p}
+        return required.issubset(parts)
+
+    def _is_target(self, tag: str, attrs) -> bool:
+        if (tag or "").lower() != self.tag:
+            return False
+        ad = self._attrs_dict(attrs)
+        if self.id_equals:
+            if str(ad.get("id") or "") != self.id_equals:
+                return False
+        cls = str(ad.get("class") or "")
+        return self._class_has_all(cls, self.required_classes)
+
+    @staticmethod
+    def _rebuild_start(tag: str, attrs) -> str:
+        if not attrs:
+            return f"<{tag}>"
+        parts = []
+        for k, v in attrs:
+            if not k:
+                continue
+            if v is None:
+                parts.append(str(k))
+            else:
+                vv = str(v).replace('"', "&quot;")
+                parts.append(f'{k}="{vv}"')
+        return f"<{tag} {' '.join(parts)}>"
+
+    def handle_starttag(self, tag, attrs):
+        if not self._capturing:
+            if self._is_target(tag, attrs):
+                self._capturing = True
+                self._depth = 1
+            return
+        # capturing inner content
+        self._depth += 1
+        self._chunks.append(self._rebuild_start(tag, attrs))
+
+    def handle_startendtag(self, tag, attrs):
+        if not self._capturing:
+            return
+        self._chunks.append(self._rebuild_start(tag, attrs)[:-1] + " />")
+
+    def handle_endtag(self, tag):
+        if not self._capturing:
+            return
+        self._depth -= 1
+        if self._depth <= 0:
+            self._capturing = False
+            self._depth = 0
+            return
+        self._chunks.append(f"</{tag}>")
+
+    def handle_data(self, data):
+        if self._capturing and data:
+            self._chunks.append(data)
+
+    def handle_entityref(self, name):
+        if self._capturing:
+            self._chunks.append(f"&{name};")
+
+    def handle_charref(self, name):
+        if self._capturing:
+            self._chunks.append(f"&#{name};")
+
+    def html(self) -> str:
+        return "".join(self._chunks)
+
+
+class PostgresWriterSimple:
+    def __init__(self):
+        self._db_mod = None
+        self._tables_ready = False
+
+    def _load_db_config(self):
+        if self._db_mod is not None:
+            return self._db_mod
+        here = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(here, "db_config.py")
+        spec = importlib.util.spec_from_file_location("_scraper_db_config", path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Cannot load db_config.py from: {path}")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self._db_mod = mod
+        return mod
+
+    def _ensure_tables(self) -> None:
+        if self._tables_ready:
+            return
+        mod = self._load_db_config()
+        conn = mod.get_connection()
+        cur = None
+        try:
+            cur = conn.cursor()
+            cur.execute(mod.CREATE_TABLES_SQL)
+            conn.commit()
+            self._tables_ready = True
+        finally:
+            if cur:
+                cur.close()
+            conn.close()
+
+    def upsert_page(self, storage_id: uuid.UUID, title: str, content: str, created_at: datetime, link: str,
+                    video_links: list[str] | None = None, image_urls: list[str] | None = None) -> None:
+        self._ensure_tables()
+        mod = self._load_db_config()
+        conn = mod.get_connection()
+        cur = None
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO storage_data (id, title, content, created_at, link)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE
+                SET title = EXCLUDED.title,
+                    content = EXCLUDED.content,
+                    created_at = EXCLUDED.created_at,
+                    link = EXCLUDED.link;
+                """,
+                (str(storage_id), (title or "")[:255], content or "", created_at, (link or "")),
+            )
+
+            for v in (video_links or []):
+                v = unescape((v or "").strip())
+                v = canonicalize_video_url(v)
+                if not v:
+                    continue
+                vid = uuid.uuid5(storage_id, f"video:{v}")
+                cur.execute(
+                    """
+                    INSERT INTO storage_video (id, storage_id, video_url)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (id) DO NOTHING;
+                    """,
+                    (str(vid), str(storage_id), v),
+                )
+
+            for u in (image_urls or []):
+                u = unescape((u or "").strip())
+                if not u:
+                    continue
+                iid = uuid.uuid5(storage_id, f"image:{u}")
+                cur.execute(
+                    """
+                    INSERT INTO storage_image (id, storage_id, image_url)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (id) DO NOTHING;
+                    """,
+                    (str(iid), str(storage_id), u),
+                )
+
+            conn.commit()
+        finally:
+            if cur:
+                cur.close()
+            conn.close()
 
 
 class CrawlAIBenhVienScraperSimple:
@@ -31,12 +441,16 @@ class CrawlAIBenhVienScraperSimple:
         input_csv: str | list[str] = "benhvien_data.csv",
         max_pages: int = None,
         concurrency: int = 10,
+        resume: bool = True,
+        retry_failed_on_resume: bool = False,
     ):
         # Cho phép 1 file hoặc nhiều file CSV
         self.input_csv = input_csv if isinstance(input_csv, list) else [input_csv]
         self.base_domain = "benhvienanbinh.vn"
         self.max_pages = max_pages
         self.concurrency = concurrency  # Số URL crawl song song
+        self.resume = bool(resume)
+        self.retry_failed_on_resume = bool(retry_failed_on_resume)
         self.crawler = None
         self.visited_urls = set()
         self.content_data = []  # {url, title, content, link (video+links), navigation}
@@ -46,11 +460,116 @@ class CrawlAIBenhVienScraperSimple:
         self._csv_file = None
         self._csv_writer = None
         self._jsonl_file = None
+        self._state: CrawlState | None = None
+        self._db_writer: PostgresWriterSimple | None = PostgresWriterSimple()
         # Cây nav tăng dần khi ghi từng kết quả (để gán nav_id cho CSV/JSONL)
         self._nav_key_to_id: dict[tuple[str, int], int] = {}
         self._nav_next_id = 2
         # Khi đọc từ file markdown * [Label](URL): nhóm theo label để xuất CSV riêng
         self._label_to_urls: dict[str, list[str]] = {}
+
+    def _set_state(self, output_root: str, events_filename: str = "events_db.jsonl") -> None:
+        self._state = CrawlState(output_root=output_root or ".", events_filename=events_filename)
+
+    def _canonical_url(self, url: str) -> str:
+        return self.normalize_path((url or "").strip())
+
+    def _storage_uuid_from_url(self, url: str) -> uuid.UUID:
+        # UUID ổn định theo URL -> resume/upsert không tạo trùng
+        return uuid.uuid5(uuid.NAMESPACE_URL, self._canonical_url(url))
+
+    def _extract_text_excluding_header_wrapper(self, html: str) -> str:
+        if not html:
+            return ""
+        p = _ContentTextExtractor(exclude_class_contains={"header-wrapper"})
+        try:
+            p.feed(html)
+            p.close()
+        except Exception:
+            return ""
+        return p.text()
+
+    def _extract_text_full_page(self, html: str) -> str:
+        """Fallback cuối: lấy toàn bộ nội dung trang (không skip nav/menu, không bỏ header-wrapper)."""
+        if not html:
+            return ""
+        p = _ContentTextExtractor(exclude_class_contains=set(), skip_nav_menu=False)
+        try:
+            p.feed(html)
+            p.close()
+        except Exception:
+            return ""
+        return p.text()
+
+    def _extract_main_content_html(self, html: str) -> str:
+        if not html:
+            return ""
+        # Ưu tiên theo template WP của benhvienanbinh.vn
+        candidates = [
+            dict(tag="div", required_classes={"entry-content", "single-page"}, id_equals=None),
+            dict(tag="div", required_classes={"entry-content"}, id_equals=None),
+            dict(tag="article", required_classes=set(), id_equals=None),
+            dict(tag="main", required_classes=set(), id_equals=None),
+            dict(tag="div", required_classes=set(), id_equals="content"),
+        ]
+        for cfg in candidates:
+            p = _ElementInnerHTMLExtractor(**cfg)
+            try:
+                p.feed(html)
+                p.close()
+                out = p.html()
+                if out and len(out.strip()) > 200:
+                    return out
+            except Exception:
+                continue
+        return ""
+
+    def _extract_page_content(self, markdown: str, html: str, url: str) -> str:
+        # Ưu tiên vùng bài viết (entry-content / article / main ...)
+        main_html = self._extract_main_content_html(html or "")
+        if main_html:
+            text = self._extract_text_excluding_header_wrapper(main_html)
+        else:
+            # fallback cuối: lấy toàn bộ nội dung trang
+            text = self._extract_text_full_page(html or "")
+        text = self._strip_urls_from_content(text)
+        text = self._clean_content(text)
+        if len(text) >= 80:
+            return text
+        # Fallback sang markdown nếu HTML text quá ngắn
+        md = self._strip_urls_from_content(markdown or "")
+        return self._clean_content(md)
+
+    async def _push_to_db(self, result: dict) -> None:
+        if not self._db_writer:
+            return
+        url = (result.get("url") or "").strip()
+        if not url:
+            return
+        storage_id = self._storage_uuid_from_url(url)
+        title = (result.get("title") or "").strip()
+        content = result.get("content") or ""
+        ts = result.get("timestamp") or ""
+        created_at = None
+        try:
+            created_at = datetime.fromisoformat(ts) if ts else None
+        except Exception:
+            created_at = None
+        if created_at is None:
+            created_at = datetime.now()
+        video_links = result.get("video_links") or []
+        image_urls = result.get("image_urls") or []
+        link = url
+        await asyncio.to_thread(
+            self._db_writer.upsert_page,
+            storage_id,
+            title,
+            content,
+            created_at,
+            link,
+            list(video_links) if isinstance(video_links, (list, tuple)) else [],
+            list(image_urls) if isinstance(image_urls, (list, tuple)) else [],
+        )
 
     def load_links_from_markdown(self, filepath: str) -> bool:
         """
@@ -216,18 +735,36 @@ class CrawlAIBenhVienScraperSimple:
 
     async def _fetch_one(self, url: str, title_from_csv: str = None) -> dict | None:
         """Một task crawl 1 URL (dùng semaphore để giới hạn đồng thời)."""
-        if url in self.visited_urls:
+        canon = self._canonical_url(url)
+        if canon in self.visited_urls:
             return None
-        self.visited_urls.add(url)
+        self.visited_urls.add(canon)
 
         async with self._semaphore:
             logger.info(
                 f"Fetching: {url} ({len(self.visited_urls)}/{len(self.urls_to_process)})"
             )
-            result = await self._do_fetch(url, title_from_csv)
-            if result:
-                self._write_result_immediately(result)
-            return result
+            err = None
+            if self._state and self.resume:
+                await self._state.record("start", canon)
+            try:
+                result = await self._do_fetch(url, title_from_csv)
+                if result:
+                    self._write_result_immediately(result)
+                    await self._push_to_db(result)
+                    if self._state and self.resume:
+                        await self._state.record("done", canon, ok=True)
+                else:
+                    err = "fetch_failed"
+                    if self._state and self.resume:
+                        await self._state.record("done", canon, ok=False, error=err)
+                return result
+            except Exception as e:
+                err = str(e)
+                logger.error(f"Fetch error {url}: {err}")
+                if self._state and self.resume:
+                    await self._state.record("done", canon, ok=False, error=err)
+                return None
 
     async def _do_fetch(self, url: str, title_from_csv: str = None) -> dict | None:
         """Thực hiện crawl 1 URL (gọi từ _fetch_one)."""
@@ -238,6 +775,8 @@ class CrawlAIBenhVienScraperSimple:
 
             if result.success:
                 html = result.html or ""
+                main_html = self._extract_main_content_html(html)
+                html_for_media = main_html or html
                 # Title: ưu tiên từ CSV, không có thì lấy từ page
                 title = title_from_csv
                 if not title:
@@ -245,12 +784,12 @@ class CrawlAIBenhVienScraperSimple:
                 if not title:
                     title = self.extract_title_from_html(html)
 
-                # Raw content = toàn bộ markdown, bỏ URL (link/video/ảnh đã lưu riêng)
-                raw_content = self._strip_urls_from_content(result.markdown or html or "")
+                # Content: bỏ phần header-wrapper để tránh trùng content, đồng thời bỏ URL
+                raw_content = self._extract_page_content(result.markdown or "", html or "", url)
 
                 # Tất cả link + video trong page
-                page_links = self.extract_links_and_videos(html, url)
-                video_links = self.extract_video_links_only(html, url)
+                page_links = self.extract_links_and_videos(html_for_media, url)
+                video_links = self.extract_video_links_only(html_for_media, url)
                 internal_links = self.extract_internal_links(html, url)
 
                 # Navigation: trang home thì dạng tree node
@@ -258,7 +797,7 @@ class CrawlAIBenhVienScraperSimple:
                 navigation = self.extract_navigation_tree(html, url) if is_home else self.extract_navigation(html)
 
                 # Ảnh: trích URL
-                image_urls = self.extract_image_urls(html, url)
+                image_urls = self.extract_image_urls(html_for_media, url)
                 images_downloaded = []
                 page_folder = ""
 
@@ -364,17 +903,27 @@ class CrawlAIBenhVienScraperSimple:
                     rf'<{tag}[^>]+src=[\'"]([^\'"]+)[\'"]',
                     html, re.IGNORECASE
                 ):
-                    u = urljoin(base_url, m.group(1).strip())
+                    u = urljoin(base_url, unescape(m.group(1).strip()))
+                    u = canonicalize_video_url(u)
+                    # Tránh nhầm ảnh vào video (một số site nhét ảnh qua src)
+                    if self._is_image_url(u):
+                        continue
                     if u not in seen:
                         seen.add(u)
                         out.append(u)
-            for m in re.finditer(r'<iframe[^>]+src=[\'"]([^\'"]+)[\'"]', html, re.IGNORECASE):
-                u = urljoin(base_url, m.group(1).strip())
-                if u not in seen:
-                    seen.add(u)
-                    out.append(u)
-            for m in re.finditer(r'data-src=[\'"]([^\'"]+)[\'"]', html, re.IGNORECASE):
-                u = urljoin(base_url, m.group(1).strip())
+
+            # Iframe embed: ưu tiên src, fallback data-src (nhưng chỉ trong tag iframe)
+            for m in re.finditer(r"<iframe\b[^>]*>", html, flags=re.IGNORECASE):
+                tag_html = m.group(0) or ""
+                src_m = re.search(r'\bsrc=[\'"]([^\'"]+)[\'"]', tag_html, flags=re.IGNORECASE)
+                if not src_m:
+                    src_m = re.search(r'\bdata-src=[\'"]([^\'"]+)[\'"]', tag_html, flags=re.IGNORECASE)
+                if not src_m:
+                    continue
+                u = urljoin(base_url, unescape((src_m.group(1) or "").strip()))
+                u = canonicalize_video_url(u)
+                if self._is_image_url(u):
+                    continue
                 if u not in seen:
                     seen.add(u)
                     out.append(u)
@@ -391,13 +940,13 @@ class CrawlAIBenhVienScraperSimple:
         try:
             # <img src="...">
             for m in re.finditer(r'<img[^>]+src=[\'"]([^\'"]+)[\'"]', html, re.IGNORECASE):
-                u = urljoin(base_url, m.group(1).strip())
+                u = urljoin(base_url, unescape(m.group(1).strip()))
                 if u not in seen and self._is_image_url(u):
                     seen.add(u)
                     out.append(u)
             # data-src, data-lazy-src (lazy load)
             for m in re.finditer(r'data-(?:lazy-)?src=[\'"]([^\'"]+)[\'"]', html, re.IGNORECASE):
-                u = urljoin(base_url, m.group(1).strip())
+                u = urljoin(base_url, unescape(m.group(1).strip()))
                 if u not in seen and self._is_image_url(u):
                     seen.add(u)
                     out.append(u)
@@ -406,7 +955,7 @@ class CrawlAIBenhVienScraperSimple:
                 for part in m.group(1).split(","):
                     part = part.strip().split()[0] if part.strip() else ""
                     if part:
-                        u = urljoin(base_url, part.strip())
+                        u = urljoin(base_url, unescape(part.strip()))
                         if u not in seen and self._is_image_url(u):
                             seen.add(u)
                             out.append(u)
@@ -1145,11 +1694,34 @@ class CrawlAIBenhVienScraperSimple:
         if not self.load_urls_from_csv():
             return
 
-        to_crawl = [
+        # Init state (resume) cho chế độ crawl theo CSV
+        self._set_state(output_root=".", events_filename="events_db.csvmode.jsonl")
+        enqueued, started, done_ok, done_failed = (set(), set(), set(), set())
+        if self.resume and self._state:
+            enqueued, started, done_ok, done_failed = self._state.load()
+            # visited_urls dùng canonical URL
+            self.visited_urls = set(done_ok)
+
+        to_crawl_all = [
             (url, title_csv)
             for url, title_csv in self.urls_to_process
             if self.is_same_domain(url)
         ]
+
+        # Filter theo resume
+        to_crawl = []
+        for url, title_csv in to_crawl_all:
+            canon = self._canonical_url(url)
+            if canon in done_ok:
+                continue
+            if (not self.retry_failed_on_resume) and (canon in done_failed):
+                continue
+            to_crawl.append((url, title_csv))
+
+        if self._state and self.resume:
+            for url, _ in to_crawl:
+                await self._state.record("enqueue", self._canonical_url(url))
+
         if not to_crawl:
             logger.warning("No URLs to crawl (same domain).")
             return
@@ -1259,8 +1831,39 @@ class CrawlAIBenhVienScraperSimple:
         self._images_dir = None  # không dùng thư mục ảnh chung khi đã dùng folder từng page
         self._download_images = bool(download_images)
 
-        to_crawl = {seed_url}
-        visited_norm = set()
+        # Init state (resume) cho chế độ seed crawl
+        self._set_state(output_root=output_dir, events_filename="events_db.seedmode.jsonl")
+        enqueued, started, done_ok, done_failed = (set(), set(), set(), set())
+        if self.resume and self._state:
+            enqueued, started, done_ok, done_failed = self._state.load()
+
+        to_crawl: set[str] = set()
+        visited_norm = set(done_ok) if self.resume else set()
+        self.visited_urls = set(done_ok) if self.resume else set()
+
+        seed_canon = self._canonical_url(seed_url)
+        if self.resume and self._state:
+            # Resume đúng pending queue: (enqueued | started) - done_ok
+            pending = (set(enqueued) | set(started)) - set(done_ok)
+            if not self.retry_failed_on_resume:
+                pending -= set(done_failed)
+
+            if seed_canon not in set(enqueued) and seed_canon not in set(done_ok):
+                pending.add(seed_canon)
+                await self._state.record("enqueue", seed_canon)
+
+            for u in pending:
+                if u not in visited_norm:
+                    to_crawl.add(u)
+
+            logger.info(
+                f"Resume enabled (seed mode): done_ok={len(done_ok)}, done_failed={len(done_failed)}, pending={len(to_crawl)}"
+            )
+        else:
+            if seed_canon not in visited_norm:
+                to_crawl.add(seed_canon)
+                if self._state and self.resume:
+                    await self._state.record("enqueue", seed_canon)
         self._semaphore = asyncio.Semaphore(concurrency or self.concurrency)
 
         try:
@@ -1300,6 +1903,8 @@ class CrawlAIBenhVienScraperSimple:
                                 u_norm = self.normalize_path(u)
                                 if u_norm not in visited_norm:
                                     to_crawl.add(u)
+                                    if self._state and self.resume:
+                                        await self._state.record("enqueue", u_norm)
 
             written = self.save_csv_by_nav(output_dir=output_dir)
             one_row_path = self.save_all_pages_one_row(output_dir, "all_pages.csv")
@@ -1337,12 +1942,30 @@ class CrawlAIBenhVienScraperSimple:
 
     async def _fetch_one_for_seed(self, url: str) -> dict | None:
         """Crawl 1 URL (dùng trong run_from_seed_url), không ghi file stream."""
-        if self.normalize_path(url) in self.visited_urls:
+        canon = self._canonical_url(url)
+        if canon in self.visited_urls:
             return None
-        self.visited_urls.add(self.normalize_path(url))
+        self.visited_urls.add(canon)
         async with self._semaphore:
             logger.info(f"Fetching: {url} (đã crawl {len(self.content_data)} trang)")
-            return await self._do_fetch(url, title_from_csv=None)
+            if self._state and self.resume:
+                await self._state.record("start", canon)
+            try:
+                result = await self._do_fetch(url, title_from_csv=None)
+                if result:
+                    await self._push_to_db(result)
+                    if self._state and self.resume:
+                        await self._state.record("done", canon, ok=True)
+                else:
+                    if self._state and self.resume:
+                        await self._state.record("done", canon, ok=False, error="fetch_failed")
+                return result
+            except Exception as e:
+                err = str(e)
+                logger.error(f"Fetch error {url}: {err}")
+                if self._state and self.resume:
+                    await self._state.record("done", canon, ok=False, error=err)
+                return None
 
     async def run_from_links_file(
         self,
@@ -1370,6 +1993,21 @@ class CrawlAIBenhVienScraperSimple:
             return
 
         self._semaphore = asyncio.Semaphore(concurrency or self.concurrency)
+        self._set_state(output_root=output_dir, events_filename="events_db.linksmode.jsonl")
+        if self.resume and self._state:
+            _, _, done_ok, done_failed = self._state.load()
+            self.visited_urls = set(done_ok)
+            filtered = []
+            for url, label in to_crawl:
+                canon = self._canonical_url(url)
+                if canon in done_ok:
+                    continue
+                if (not self.retry_failed_on_resume) and (canon in done_failed):
+                    continue
+                filtered.append((url, label))
+            to_crawl = filtered
+            for url, _ in to_crawl:
+                await self._state.record("enqueue", self._canonical_url(url))
 
         try:
             async with AsyncWebCrawler() as crawler:

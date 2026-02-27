@@ -8,17 +8,64 @@ import json
 import os
 import sys
 import uuid
+from html import unescape
+from urllib.parse import parse_qs, urlencode, urlparse
+import re
 
 # Thư mục gốc repo (parent của scrapling_demo)
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_JSON = os.path.join(REPO_ROOT, "csv_by_nav", "all_data.json")
 
 
+def canonicalize_video_url(url: str) -> str:
+    u = (url or "").strip()
+    if not u:
+        return ""
+    if u.startswith("//"):
+        u = "https:" + u
+    try:
+        p = urlparse(u)
+    except Exception:
+        return u
+
+    host = (p.netloc or "").lower()
+    path = p.path or ""
+
+    def _watch_url(video_id: str, query: str) -> str:
+        q = parse_qs(query or "", keep_blank_values=False)
+        for k in ("feature", "si"):
+            q.pop(k, None)
+        params: list[tuple[str, str]] = [("v", video_id)]
+        for k, vals in q.items():
+            for v in vals:
+                if v is not None and v != "":
+                    params.append((k, v))
+        return "https://www.youtube.com/watch?" + urlencode(params, doseq=True)
+
+    if host == "youtu.be":
+        vid = path.strip("/").split("/")[0] if path else ""
+        return _watch_url(vid, p.query) if vid else u
+
+    if host.endswith("youtube.com") or host.endswith("youtube-nocookie.com"):
+        if path.startswith("/embed/videoseries"):
+            q = parse_qs(p.query or "")
+            lst = (q.get("list") or [None])[0]
+            if lst:
+                return f"https://www.youtube.com/playlist?list={lst}"
+            return u
+        m = re.match(r"^/embed/([^/?#]+)", path or "")
+        if m:
+            return _watch_url(m.group(1), p.query)
+
+    return u
+
+
 def insert_from_json(json_path: str, create_tables: bool = True) -> None:
-    from db_config import get_connection, create_tables_if_not_exist
+    from db_config import get_connection, create_tables_if_not_exist, migrate_url_columns_to_text
 
     if create_tables:
         create_tables_if_not_exist()
+        migrate_url_columns_to_text()
 
     if not os.path.isfile(json_path):
         print(f"Không tìm thấy file: {json_path}")
@@ -42,7 +89,7 @@ def insert_from_json(json_path: str, create_tables: bool = True) -> None:
             sid = row.get("id")
             title = (row.get("title") or "")[:255]
             content = row.get("content") or ""
-            link = (row.get("link") or "")[:255]
+            link = unescape((row.get("link") or "").strip())
             created_at = row.get("created_at") or None
 
             # created_at: nếu None/rỗng thì dùng CURRENT_TIMESTAMP
@@ -57,12 +104,13 @@ def insert_from_json(json_path: str, create_tables: bool = True) -> None:
 
             for v in row.get("video_links") or []:
                 if v and isinstance(v, str) and v.strip():
+                    vv = canonicalize_video_url(unescape(v.strip()))
                     cur.execute(
                         """
                         INSERT INTO storage_video (id, storage_id, video_url)
                         VALUES (%s::uuid, %s::uuid, %s)
                         """,
-                        (str(uuid.uuid4()), sid, v.strip()[:500]),
+                        (str(uuid.uuid4()), sid, vv),
                     )
                     inserted_video += 1
 
@@ -73,7 +121,7 @@ def insert_from_json(json_path: str, create_tables: bool = True) -> None:
                         INSERT INTO storage_image (id, storage_id, image_url)
                         VALUES (%s::uuid, %s::uuid, %s)
                         """,
-                        (str(uuid.uuid4()), sid, img.strip()[:500]),
+                        (str(uuid.uuid4()), sid, unescape(img.strip())),
                     )
                     inserted_image += 1
 

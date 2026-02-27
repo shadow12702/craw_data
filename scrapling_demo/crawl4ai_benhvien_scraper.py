@@ -4,11 +4,13 @@ import json
 import logging
 import re
 import uuid
+from html import unescape
+from html.parser import HTMLParser
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional
-from urllib.parse import ParseResult, urljoin, urlparse, urlunparse
+from urllib.parse import ParseResult, parse_qs, urlencode, urljoin, urlparse, urlunparse
 
 try:
     import psycopg
@@ -111,6 +113,56 @@ def normalize_url(url: str, base_url: str) -> Optional[str]:
     return urlunparse(normalized)
 
 
+def canonicalize_video_url(url: str) -> str:
+    """
+    Chuẩn hóa URL video để dễ click từ DB.
+    Đặc biệt: chuyển YouTube embed (/embed/..., /embed/videoseries) -> watch/playlist.
+    """
+    u = (url or "").strip()
+    if not u:
+        return ""
+    if u.startswith("//"):
+        u = "https:" + u
+    try:
+        p = urlparse(u)
+    except Exception:
+        return u
+
+    host = (p.netloc or "").lower()
+    path = p.path or ""
+
+    def _watch_url(video_id: str, query: str) -> str:
+        q = parse_qs(query or "", keep_blank_values=False)
+        # remove noisy params
+        for k in ("feature", "si"):
+            q.pop(k, None)
+        params: list[tuple[str, str]] = [("v", video_id)]
+        for k, vals in q.items():
+            for v in vals:
+                if v is not None and v != "":
+                    params.append((k, v))
+        return "https://www.youtube.com/watch?" + urlencode(params, doseq=True)
+
+    if host in ("youtu.be",):
+        vid = path.strip("/").split("/")[0] if path else ""
+        return _watch_url(vid, p.query) if vid else u
+
+    if host.endswith("youtube.com") or host.endswith("youtube-nocookie.com"):
+        # playlist embed
+        if path.startswith("/embed/videoseries"):
+            q = parse_qs(p.query or "")
+            lst = (q.get("list") or [None])[0]
+            if lst:
+                return f"https://www.youtube.com/playlist?list={lst}"
+            return u
+        m = re.match(r"^/embed/([^/?#]+)", path)
+        if m:
+            vid = m.group(1)
+            return _watch_url(vid, p.query)
+
+    return u
+
+
 def is_related_domain(url: str, base_domain: str, extra_allow_domains: Iterable[str]) -> bool:
     try:
         netloc = urlparse(url).netloc.lower().strip(".")
@@ -159,10 +211,497 @@ def strip_media_from_markdown(markdown: str) -> str:
     return md.strip()
 
 
+def strip_navigation_menu_from_markdown(markdown: str) -> str:
+    """
+    Crawl4AI markdown thường chứa phần menu/header (nhiều link, "MENUMENU", "Chuyển đến nội dung") ở đầu trang.
+    Hàm này cắt bỏ phần đó để tránh menu bị lẫn vào cột content.
+    """
+    md = (markdown or "").strip()
+    if not md:
+        return ""
+    lines = md.splitlines()
+    first_heading_idx = None
+    for i, ln in enumerate(lines):
+        if re.match(r"^\s*#\s+\S", ln):
+            first_heading_idx = i
+            break
+    if first_heading_idx is None or first_heading_idx <= 0:
+        return md
+
+    pre = "\n".join(lines[:first_heading_idx]).lower()
+    menu_markers = ("menumenu", "chuyển đến nội dung", "skip to content", "menu")
+    link_bullets = pre.count("* [") + pre.count("- [")
+    if any(m in pre for m in menu_markers) or link_bullets >= 8:
+        trimmed = "\n".join(lines[first_heading_idx:]).strip()
+        trimmed = re.sub(r"\n{3,}", "\n\n", trimmed).strip()
+        return trimmed
+    return md
+
+
+class _EntryContentHTMLExtractor(HTMLParser):
+    """Lấy inner HTML của div.entry-content.single-page (nội dung bài viết)."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=False)
+        self._depth = 0
+        self._capturing = False
+        self._chunks: list[str] = []
+
+    @staticmethod
+    def _attrs_dict(attrs) -> dict[str, str]:
+        try:
+            return {k.lower(): (v or "") for k, v in (attrs or []) if k}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _class_has_all(cls: str, required: set[str]) -> bool:
+        parts = {p for p in re.split(r"\s+", (cls or "").strip()) if p}
+        return required.issubset(parts)
+
+    def _is_target_div(self, tag: str, attrs) -> bool:
+        if (tag or "").lower() != "div":
+            return False
+        ad = self._attrs_dict(attrs)
+        cls = str(ad.get("class") or "")
+        return self._class_has_all(cls, {"entry-content", "single-page"})
+
+    @staticmethod
+    def _rebuild_start(tag: str, attrs) -> str:
+        if not attrs:
+            return f"<{tag}>"
+        parts = []
+        for k, v in attrs:
+            if not k:
+                continue
+            if v is None:
+                parts.append(str(k))
+            else:
+                vv = str(v).replace('"', "&quot;")
+                parts.append(f'{k}="{vv}"')
+        return f"<{tag} {' '.join(parts)}>"
+
+    def handle_starttag(self, tag, attrs):
+        if not self._capturing:
+            if self._is_target_div(tag, attrs):
+                self._capturing = True
+                self._depth = 1
+            return
+        self._depth += 1
+        self._chunks.append(self._rebuild_start(tag, attrs))
+
+    def handle_startendtag(self, tag, attrs):
+        if not self._capturing:
+            return
+        self._chunks.append(self._rebuild_start(tag, attrs)[:-1] + " />")
+
+    def handle_endtag(self, tag):
+        if not self._capturing:
+            return
+        self._depth -= 1
+        if self._depth <= 0:
+            self._capturing = False
+            self._depth = 0
+            return
+        self._chunks.append(f"</{tag}>")
+
+    def handle_data(self, data):
+        if self._capturing and data:
+            self._chunks.append(data)
+
+    def handle_entityref(self, name):
+        if self._capturing:
+            self._chunks.append(f"&{name};")
+
+    def handle_charref(self, name):
+        if self._capturing:
+            self._chunks.append(f"&#{name};")
+
+    def html(self) -> str:
+        return "".join(self._chunks)
+
+
+class _HTMLTextExtractor(HTMLParser):
+    """Chuyển HTML -> text, giữ xuống dòng theo block tags."""
+
+    _BLOCK = {
+        "p", "br", "div", "section", "article", "main",
+        "h1", "h2", "h3", "h4", "h5", "h6",
+        "ul", "ol", "li",
+        "table", "thead", "tbody", "tr", "td", "th",
+        "blockquote",
+    }
+
+    def __init__(self):
+        super().__init__(convert_charrefs=False)
+        self._skip = 0
+        self._chunks: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        t = (tag or "").lower()
+        if self._skip > 0:
+            self._skip += 1
+            return
+        if t in ("script", "style", "noscript"):
+            self._skip = 1
+            return
+        if t in self._BLOCK:
+            self._chunks.append("\n")
+
+    def handle_endtag(self, tag):
+        if self._skip > 0:
+            self._skip -= 1
+            return
+        t = (tag or "").lower()
+        if t in self._BLOCK:
+            self._chunks.append("\n")
+
+    def handle_data(self, data):
+        if self._skip > 0:
+            return
+        if data:
+            self._chunks.append(data)
+
+    def handle_entityref(self, name):
+        if self._skip > 0:
+            return
+        self._chunks.append(f"&{name};")
+
+    def handle_charref(self, name):
+        if self._skip > 0:
+            return
+        self._chunks.append(f"&#{name};")
+
+    def text(self) -> str:
+        s = unescape("".join(self._chunks))
+        s = re.sub(r"[^\S\n]+", " ", s)
+        s = re.sub(r"\n{3,}", "\n\n", s).strip()
+        return s
+
+
+def extract_main_content_html(html: str) -> str:
+    """
+    Trích vùng nội dung chính theo nhiều template:
+    - div.entry-content.single-page (ưu tiên)
+    - div.entry-content
+    - article
+    - main
+    - #content
+    """
+    if not html:
+        return ""
+
+    def _run(tag: str, required_classes: set[str] | None = None, id_equals: str | None = None) -> str:
+        p = _EntryContentHTMLExtractor()  # reuse class; match by adjusting required sets via local check
+        # fallback: dùng regex nhẹ để chọn 1 block phổ biến nếu không match đúng class
+        # (giữ đơn giản, ưu tiên các container phổ biến trước)
+        return ""
+
+    # Parser cụ thể cho các container phổ biến (copy logic đơn giản từ simple)
+    class _ElementInnerHTMLExtractor(HTMLParser):
+        def __init__(self, *, tag: str, required_classes: set[str] | None = None, id_equals: str | None = None):
+            super().__init__(convert_charrefs=False)
+            self.tag = (tag or "").lower()
+            self.required_classes = required_classes or set()
+            self.id_equals = id_equals
+            self._depth = 0
+            self._capturing = False
+            self._chunks: list[str] = []
+
+        @staticmethod
+        def _attrs_dict(attrs) -> dict[str, str]:
+            try:
+                return {k.lower(): (v or "") for k, v in (attrs or []) if k}
+            except Exception:
+                return {}
+
+        @staticmethod
+        def _class_has_all(cls: str, required: set[str]) -> bool:
+            parts = {p for p in re.split(r"\s+", (cls or "").strip()) if p}
+            return required.issubset(parts)
+
+        def _is_target(self, tag: str, attrs) -> bool:
+            if (tag or "").lower() != self.tag:
+                return False
+            ad = self._attrs_dict(attrs)
+            if self.id_equals:
+                if str(ad.get("id") or "") != self.id_equals:
+                    return False
+            cls = str(ad.get("class") or "")
+            return self._class_has_all(cls, self.required_classes)
+
+        @staticmethod
+        def _rebuild_start(tag: str, attrs) -> str:
+            if not attrs:
+                return f"<{tag}>"
+            parts = []
+            for k, v in attrs:
+                if not k:
+                    continue
+                if v is None:
+                    parts.append(str(k))
+                else:
+                    vv = str(v).replace('"', "&quot;")
+                    parts.append(f'{k}="{vv}"')
+            return f"<{tag} {' '.join(parts)}>"
+
+        def handle_starttag(self, tag, attrs):
+            if not self._capturing:
+                if self._is_target(tag, attrs):
+                    self._capturing = True
+                    self._depth = 1
+                return
+            self._depth += 1
+            self._chunks.append(self._rebuild_start(tag, attrs))
+
+        def handle_startendtag(self, tag, attrs):
+            if not self._capturing:
+                return
+            self._chunks.append(self._rebuild_start(tag, attrs)[:-1] + " />")
+
+        def handle_endtag(self, tag):
+            if not self._capturing:
+                return
+            self._depth -= 1
+            if self._depth <= 0:
+                self._capturing = False
+                self._depth = 0
+                return
+            self._chunks.append(f"</{tag}>")
+
+        def handle_data(self, data):
+            if self._capturing and data:
+                self._chunks.append(data)
+
+        def handle_entityref(self, name):
+            if self._capturing:
+                self._chunks.append(f"&{name};")
+
+        def handle_charref(self, name):
+            if self._capturing:
+                self._chunks.append(f"&#{name};")
+
+        def html(self) -> str:
+            return "".join(self._chunks)
+
+    candidates = [
+        dict(tag="div", required_classes={"entry-content", "single-page"}, id_equals=None),
+        dict(tag="div", required_classes={"entry-content"}, id_equals=None),
+        dict(tag="article", required_classes=set(), id_equals=None),
+        dict(tag="main", required_classes=set(), id_equals=None),
+        dict(tag="div", required_classes=set(), id_equals="content"),
+    ]
+    for cfg in candidates:
+        p = _ElementInnerHTMLExtractor(**cfg)
+        try:
+            p.feed(html)
+            p.close()
+            out = p.html()
+            if out and len(out.strip()) > 200:
+                return out
+        except Exception:
+            continue
+    return ""
+
+
+class _HeaderWrapperTextExtractor(HTMLParser):
+    """
+    Trích text nằm trong element có class chứa 'header-wrapper'.
+    Dùng để lọc bỏ các dòng header ra khỏi content markdown (tránh trùng content).
+    """
+
+    def __init__(self):
+        super().__init__(convert_charrefs=False)
+        self._in_header = 0
+        self._skip = 0  # script/style/noscript
+        self._chunks: list[str] = []
+
+    @staticmethod
+    def _attrs_dict(attrs) -> dict[str, str]:
+        try:
+            return {k.lower(): (v or "") for k, v in (attrs or []) if k}
+        except Exception:
+            return {}
+
+    def handle_starttag(self, tag, attrs):
+        tag = (tag or "").lower()
+        if self._skip > 0:
+            self._skip += 1
+            return
+        if tag in ("script", "style", "noscript"):
+            self._skip = 1
+            return
+
+        if self._in_header > 0:
+            self._in_header += 1
+            return
+
+        if tag == "div":
+            ad = self._attrs_dict(attrs)
+            cls = ad.get("class", "")
+            if "header-wrapper" in cls:
+                self._in_header = 1
+
+    def handle_endtag(self, tag):
+        if self._skip > 0:
+            self._skip -= 1
+            return
+        if self._in_header > 0:
+            self._in_header -= 1
+            return
+
+    def handle_data(self, data):
+        if self._skip > 0 or self._in_header <= 0:
+            return
+        if data:
+            self._chunks.append(data)
+            self._chunks.append("\n")
+
+    def handle_entityref(self, name):
+        if self._skip > 0 or self._in_header <= 0:
+            return
+        self._chunks.append(f"&{name};")
+
+    def handle_charref(self, name):
+        if self._skip > 0 or self._in_header <= 0:
+            return
+        self._chunks.append(f"&#{name};")
+
+    def text(self) -> str:
+        return unescape("".join(self._chunks))
+
+
+class _BodyTextExcludingHeaderWrapper(HTMLParser):
+    """Trích text body, bỏ mọi thứ nằm trong header-wrapper (và script/style)."""
+
+    _BLOCK_TAGS = {
+        "p", "br", "div", "section", "article", "main",
+        "h1", "h2", "h3", "h4", "h5", "h6",
+        "ul", "ol", "li",
+        "table", "thead", "tbody", "tr", "td", "th",
+        "blockquote",
+    }
+
+    def __init__(self):
+        super().__init__(convert_charrefs=False)
+        self._in_header = 0
+        self._skip = 0
+        self._chunks: list[str] = []
+
+    @staticmethod
+    def _attrs_dict(attrs) -> dict[str, str]:
+        try:
+            return {k.lower(): (v or "") for k, v in (attrs or []) if k}
+        except Exception:
+            return {}
+
+    def handle_starttag(self, tag, attrs):
+        tag = (tag or "").lower()
+        if self._in_header > 0:
+            self._in_header += 1
+            return
+        if self._skip > 0:
+            self._skip += 1
+            return
+        if tag in ("script", "style", "noscript"):
+            self._skip = 1
+            return
+        if tag == "div":
+            ad = self._attrs_dict(attrs)
+            cls = ad.get("class", "")
+            if "header-wrapper" in cls:
+                self._in_header = 1
+                return
+        if tag in self._BLOCK_TAGS:
+            self._chunks.append("\n")
+
+    def handle_endtag(self, tag):
+        if self._in_header > 0:
+            self._in_header -= 1
+            return
+        if self._skip > 0:
+            self._skip -= 1
+            return
+        tag = (tag or "").lower()
+        if tag in self._BLOCK_TAGS:
+            self._chunks.append("\n")
+
+    def handle_data(self, data):
+        if self._in_header > 0 or self._skip > 0:
+            return
+        if data:
+            self._chunks.append(data)
+
+    def handle_entityref(self, name):
+        if self._in_header > 0 or self._skip > 0:
+            return
+        self._chunks.append(f"&{name};")
+
+    def handle_charref(self, name):
+        if self._in_header > 0 or self._skip > 0:
+            return
+        self._chunks.append(f"&#{name};")
+
+    def text(self) -> str:
+        return unescape("".join(self._chunks))
+
+
+def _norm_line(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def strip_header_wrapper_from_content(markdown: str, html: str) -> str:
+    """
+    Xóa phần header-wrapper khỏi cột content để tránh trùng content.
+
+    - Nếu markdown có sẵn: lọc bỏ các dòng trùng với text trích từ header-wrapper.
+    - Nếu markdown rỗng: fallback trích text từ HTML (đã bỏ header-wrapper) để lưu làm content.
+    """
+    md = (markdown or "").strip()
+    h = html or ""
+
+    if md:
+        p = _HeaderWrapperTextExtractor()
+        try:
+            p.feed(h)
+            p.close()
+        except Exception:
+            return md
+        header_text = p.text()
+        header_lines = {_norm_line(x) for x in header_text.splitlines() if _norm_line(x)}
+        if not header_lines:
+            return md
+        kept: list[str] = []
+        for ln in md.splitlines():
+            if _norm_line(ln) in header_lines:
+                continue
+            kept.append(ln)
+        cleaned = "\n".join(kept)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+        return cleaned
+
+    if h.strip():
+        p2 = _BodyTextExcludingHeaderWrapper()
+        try:
+            p2.feed(h)
+            p2.close()
+        except Exception:
+            return ""
+        text = p2.text()
+        text = re.sub(r"[^\S\n]+", " ", text)
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+        return text
+
+    return ""
+
+
 def _extract_tag_attrs(tag_html: str) -> dict[str, str]:
     attrs: dict[str, str] = {}
     for m in re.finditer(r"(\w+)\s*=\s*['\"]([^'\"]+)['\"]", tag_html):
-        attrs[m.group(1).lower()] = m.group(2).strip()
+        # HTML attrs đôi khi có entity (vd: &amp;) -> decode để URL dùng được khi lưu DB
+        attrs[m.group(1).lower()] = unescape(m.group(2).strip())
     return attrs
 
 
@@ -170,6 +709,29 @@ def _extract_tag_attrs(tag_html: str) -> dict[str, str]:
 class MediaItem:
     url: str
     name: str  # caption/alt/title; "none" if missing
+
+
+def _is_image_url(url: str) -> bool:
+    u = (url or "").lower().split("?")[0].split("#")[0]
+    return any(u.endswith(e) for e in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".bmp", ".ico", ".avif"))
+
+
+def _is_video_url(url: str) -> bool:
+    u = (url or "").lower().split("?")[0].split("#")[0]
+    if any(u.endswith(e) for e in (".mp4", ".webm", ".m3u8", ".mov", ".m4v", ".ogg", ".ogv", ".mp3", ".wav", ".m4a")):
+        return True
+    # common embed/video hosts
+    return any(h in u for h in ("youtube.com", "youtu.be", "vimeo.com", "player.vimeo.com"))
+
+
+def _looks_like_video_embed(url: str) -> bool:
+    u = (url or "").lower()
+    if _is_video_url(u):
+        return True
+    # generic embed signals (still filter out obvious images)
+    if _is_image_url(u):
+        return False
+    return any(s in u for s in ("/embed", "youtube", "youtu.be", "vimeo", "video"))
 
 
 def extract_media(markdown: str, html: str, page_url: str) -> tuple[list[MediaItem], list[MediaItem]]:
@@ -183,7 +745,13 @@ def extract_media(markdown: str, html: str, page_url: str) -> tuple[list[MediaIt
         alt = (m.group(1) or "").strip()
         raw = (m.group(2) or "").strip().strip('"').strip("'")
         nu = normalize_url(raw, page_url)
-        if nu:
+        if not nu:
+            continue
+        nu = canonicalize_video_url(nu)
+        # Markdown image đôi khi trỏ nhầm sang media khác; chặn lẫn chéo.
+        if _is_video_url(nu) and not _is_image_url(nu):
+            videos.append(MediaItem(url=nu, name=alt or "none"))
+        else:
             images.append(MediaItem(url=nu, name=alt or "none"))
 
     for m in re.finditer(r"<img\b[^>]*>", h, flags=re.IGNORECASE):
@@ -193,18 +761,49 @@ def extract_media(markdown: str, html: str, page_url: str) -> tuple[list[MediaIt
         nu = normalize_url(src, page_url)
         if not nu:
             continue
+        nu = canonicalize_video_url(nu)
         name = (attrs.get("alt") or attrs.get("title") or "").strip() or "none"
-        images.append(MediaItem(url=nu, name=name))
+        if _is_video_url(nu) and not _is_image_url(nu):
+            videos.append(MediaItem(url=nu, name=name))
+        else:
+            images.append(MediaItem(url=nu, name=name))
 
-    for m in re.finditer(r"<(?:video|source)\b[^>]*>", h, flags=re.IGNORECASE):
+    # Video/audio tags
+    for m in re.finditer(r"<(?:video|audio)\b[^>]*>", h, flags=re.IGNORECASE):
         tag = m.group(0)
         attrs = _extract_tag_attrs(tag)
         src = attrs.get("src") or ""
         nu = normalize_url(src, page_url)
         if not nu:
             continue
+        nu = canonicalize_video_url(nu)
         name = (attrs.get("title") or attrs.get("aria-label") or "").strip() or "none"
-        videos.append(MediaItem(url=nu, name=name))
+        if _is_image_url(nu):
+            images.append(MediaItem(url=nu, name=name))
+        else:
+            videos.append(MediaItem(url=nu, name=name))
+
+    # <source> xuất hiện cả trong <picture> (ảnh) lẫn <video>/<audio> (media).
+    # Chỉ coi là video nếu có type=video/*|audio/* hoặc URL trông như video.
+    for m in re.finditer(r"<source\b[^>]*>", h, flags=re.IGNORECASE):
+        tag = m.group(0)
+        attrs = _extract_tag_attrs(tag)
+        src = attrs.get("src") or ""
+        nu = normalize_url(src, page_url)
+        if not nu:
+            continue
+        nu = canonicalize_video_url(nu)
+        typ = (attrs.get("type") or "").lower().strip()
+        name = (attrs.get("title") or attrs.get("aria-label") or "").strip() or "none"
+        is_media_by_type = typ.startswith("video/") or typ.startswith("audio/")
+        if _is_image_url(nu) and not is_media_by_type:
+            images.append(MediaItem(url=nu, name=name))
+            continue
+        if is_media_by_type or _is_video_url(nu):
+            videos.append(MediaItem(url=nu, name=name))
+        else:
+            # default an toàn: đừng nhét vào videos nếu không chắc
+            images.append(MediaItem(url=nu, name=name))
 
     for m in re.finditer(r"<iframe\b[^>]*>", h, flags=re.IGNORECASE):
         tag = m.group(0)
@@ -213,8 +812,10 @@ def extract_media(markdown: str, html: str, page_url: str) -> tuple[list[MediaIt
         nu = normalize_url(src, page_url)
         if not nu:
             continue
+        nu = canonicalize_video_url(nu)
         name = (attrs.get("title") or attrs.get("aria-label") or "").strip() or "none"
-        videos.append(MediaItem(url=nu, name=name))
+        if _looks_like_video_embed(nu):
+            videos.append(MediaItem(url=nu, name=name))
 
     for m in re.finditer(
         r"(https?://[^\s)\"']+\.(?:mp4|webm|m3u8))(?:\?[^\s)\"']*)?",
@@ -223,6 +824,7 @@ def extract_media(markdown: str, html: str, page_url: str) -> tuple[list[MediaIt
     ):
         nu = normalize_url(m.group(0), page_url)
         if nu:
+            nu = canonicalize_video_url(nu)
             videos.append(MediaItem(url=nu, name="none"))
 
     img_map: dict[str, str] = {}
@@ -231,6 +833,20 @@ def extract_media(markdown: str, html: str, page_url: str) -> tuple[list[MediaIt
     vid_map: dict[str, str] = {}
     for it in videos:
         vid_map.setdefault(it.url, it.name or "none")
+
+    # Final guard: không cho URL ảnh nằm trong video và ngược lại.
+    for u in list(vid_map.keys()):
+        if _is_image_url(u):
+            vid_map.pop(u, None)
+    for u in list(img_map.keys()):
+        if _is_video_url(u) and not _is_image_url(u):
+            img_map.pop(u, None)
+    for u in set(img_map.keys()) & set(vid_map.keys()):
+        # Nếu overlap, ưu tiên phân loại theo extension/heuristic
+        if _is_image_url(u):
+            vid_map.pop(u, None)
+        elif _is_video_url(u):
+            img_map.pop(u, None)
 
     images_out = [MediaItem(url=u, name=n or "none") for u, n in img_map.items()]
     videos_out = [MediaItem(url=u, name=n or "none") for u, n in vid_map.items()]
@@ -302,8 +918,12 @@ class PostgresWriter:
                           content = EXCLUDED.content,
                           link = EXCLUDED.link;
                     """,
-                    (doc_id, (page.title or "")[:255], content, page.url[:500]),
+                    (doc_id, (page.title or "")[:255], content, page.url),
                 )
+
+                # Sync media: on rerun, replace old rows for this page (no append).
+                cur.execute("DELETE FROM storage_image WHERE storage_id = %s;", (doc_id,))
+                cur.execute("DELETE FROM storage_video WHERE storage_id = %s;", (doc_id,))
 
                 if page.images:
                     cur.executemany(
@@ -313,12 +933,17 @@ class PostgresWriter:
                         ON CONFLICT (id) DO NOTHING;
                         """,
                         [
-                            (self._media_id(doc_id, "image", img.url), doc_id, img.url[:500])
+                            (self._media_id(doc_id, "image", img.url), doc_id, img.url)
                             for img in page.images
                         ],
                     )
 
                 if page.videos:
+                    videos = [
+                        MediaItem(url=canonicalize_video_url(v.url), name=v.name)
+                        for v in page.videos
+                        if (v.url or "").strip()
+                    ]
                     cur.executemany(
                         """
                         INSERT INTO storage_video (id, storage_id, video_url)
@@ -326,8 +951,8 @@ class PostgresWriter:
                         ON CONFLICT (id) DO NOTHING;
                         """,
                         [
-                            (self._media_id(doc_id, "video", v.url), doc_id, v.url[:500])
-                            for v in page.videos
+                            (self._media_id(doc_id, "video", v.url), doc_id, v.url)
+                            for v in videos
                         ],
                     )
             conn.commit()
@@ -483,11 +1108,20 @@ class CrawlAIBenhVienScraper:
             html = getattr(result, "html", "") or ""
 
             title = extract_title_from_markdown(markdown) or extract_title_from_html(html) or url
-            images, videos = extract_media(markdown, html, url)
-            content_md = strip_media_from_markdown(markdown) if markdown else ""
+            entry_html = extract_main_content_html(html) or html
+
+            md_no_menu = strip_navigation_menu_from_markdown(markdown) if markdown else ""
+            images, videos = extract_media(md_no_menu, entry_html, url)
+
+            # Content: keep Markdown (including in-content navigation/tab URLs).
+            # Only strip site-level header/menu noise and media embeds.
+            content_md = strip_media_from_markdown(md_no_menu).strip() if md_no_menu else ""
+            if html:
+                content_md = strip_header_wrapper_from_content(content_md, html).strip()
 
             if not content_md.strip() and html:
-                content_md = html.strip()
+                # Final fallback: extract body text (may lose URLs, but only when markdown is empty).
+                content_md = strip_header_wrapper_from_content("", html).strip() or html.strip()
 
             item = PageItem(
                 url=url,
