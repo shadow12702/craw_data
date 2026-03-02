@@ -163,7 +163,9 @@ def canonicalize_video_url(url: str) -> str:
     return u
 
 
-def is_related_domain(url: str, base_domain: str, extra_allow_domains: Iterable[str]) -> bool:
+def is_related_domain(
+    url: str, base_domain: str, extra_allow_domains: Iterable[str]
+) -> bool:
     try:
         netloc = urlparse(url).netloc.lower().strip(".")
     except Exception:
@@ -325,10 +327,27 @@ class _HTMLTextExtractor(HTMLParser):
     """Chuyển HTML -> text, giữ xuống dòng theo block tags."""
 
     _BLOCK = {
-        "p", "br", "div", "section", "article", "main",
-        "h1", "h2", "h3", "h4", "h5", "h6",
-        "ul", "ol", "li",
-        "table", "thead", "tbody", "tr", "td", "th",
+        "p",
+        "br",
+        "div",
+        "section",
+        "article",
+        "main",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "ul",
+        "ol",
+        "li",
+        "table",
+        "thead",
+        "tbody",
+        "tr",
+        "td",
+        "th",
         "blockquote",
     }
 
@@ -391,15 +410,25 @@ def extract_main_content_html(html: str) -> str:
     if not html:
         return ""
 
-    def _run(tag: str, required_classes: set[str] | None = None, id_equals: str | None = None) -> str:
-        p = _EntryContentHTMLExtractor()  # reuse class; match by adjusting required sets via local check
+    def _run(
+        tag: str, required_classes: set[str] | None = None, id_equals: str | None = None
+    ) -> str:
+        p = (
+            _EntryContentHTMLExtractor()
+        )  # reuse class; match by adjusting required sets via local check
         # fallback: dùng regex nhẹ để chọn 1 block phổ biến nếu không match đúng class
         # (giữ đơn giản, ưu tiên các container phổ biến trước)
         return ""
 
     # Parser cụ thể cho các container phổ biến (copy logic đơn giản từ simple)
     class _ElementInnerHTMLExtractor(HTMLParser):
-        def __init__(self, *, tag: str, required_classes: set[str] | None = None, id_equals: str | None = None):
+        def __init__(
+            self,
+            *,
+            tag: str,
+            required_classes: set[str] | None = None,
+            id_equals: str | None = None,
+        ):
             super().__init__(convert_charrefs=False)
             self.tag = (tag or "").lower()
             self.required_classes = required_classes or set()
@@ -485,7 +514,9 @@ def extract_main_content_html(html: str) -> str:
             return "".join(self._chunks)
 
     candidates = [
-        dict(tag="div", required_classes={"entry-content", "single-page"}, id_equals=None),
+        dict(
+            tag="div", required_classes={"entry-content", "single-page"}, id_equals=None
+        ),
         dict(tag="div", required_classes={"entry-content"}, id_equals=None),
         dict(tag="article", required_classes=set(), id_equals=None),
         dict(tag="main", required_classes=set(), id_equals=None),
@@ -575,10 +606,27 @@ class _BodyTextExcludingHeaderWrapper(HTMLParser):
     """Trích text body, bỏ mọi thứ nằm trong header-wrapper (và script/style)."""
 
     _BLOCK_TAGS = {
-        "p", "br", "div", "section", "article", "main",
-        "h1", "h2", "h3", "h4", "h5", "h6",
-        "ul", "ol", "li",
-        "table", "thead", "tbody", "tr", "td", "th",
+        "p",
+        "br",
+        "div",
+        "section",
+        "article",
+        "main",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "ul",
+        "ol",
+        "li",
+        "table",
+        "thead",
+        "tbody",
+        "tr",
+        "td",
+        "th",
         "blockquote",
     }
 
@@ -670,7 +718,9 @@ def strip_header_wrapper_from_content(markdown: str, html: str) -> str:
         except Exception:
             return md
         header_text = p.text()
-        header_lines = {_norm_line(x) for x in header_text.splitlines() if _norm_line(x)}
+        header_lines = {
+            _norm_line(x) for x in header_text.splitlines() if _norm_line(x)
+        }
         if not header_lines:
             return md
         kept: list[str] = []
@@ -713,15 +763,44 @@ class MediaItem:
 
 def _is_image_url(url: str) -> bool:
     u = (url or "").lower().split("?")[0].split("#")[0]
-    return any(u.endswith(e) for e in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".bmp", ".ico", ".avif"))
+    return any(
+        u.endswith(e)
+        for e in (
+            ".jpg",
+            ".jpeg",
+            ".png",
+            ".gif",
+            ".webp",
+            ".svg",
+            ".bmp",
+            ".ico",
+            ".avif",
+        )
+    )
 
 
 def _is_video_url(url: str) -> bool:
     u = (url or "").lower().split("?")[0].split("#")[0]
-    if any(u.endswith(e) for e in (".mp4", ".webm", ".m3u8", ".mov", ".m4v", ".ogg", ".ogv", ".mp3", ".wav", ".m4a")):
+    if any(
+        u.endswith(e)
+        for e in (
+            ".mp4",
+            ".webm",
+            ".m3u8",
+            ".mov",
+            ".m4v",
+            ".ogg",
+            ".ogv",
+            ".mp3",
+            ".wav",
+            ".m4a",
+        )
+    ):
         return True
     # common embed/video hosts
-    return any(h in u for h in ("youtube.com", "youtu.be", "vimeo.com", "player.vimeo.com"))
+    return any(
+        h in u for h in ("youtube.com", "youtu.be", "vimeo.com", "player.vimeo.com")
+    )
 
 
 def _looks_like_video_embed(url: str) -> bool:
@@ -734,7 +813,9 @@ def _looks_like_video_embed(url: str) -> bool:
     return any(s in u for s in ("/embed", "youtube", "youtu.be", "vimeo", "video"))
 
 
-def extract_media(markdown: str, html: str, page_url: str) -> tuple[list[MediaItem], list[MediaItem]]:
+def extract_media(
+    markdown: str, html: str, page_url: str
+) -> tuple[list[MediaItem], list[MediaItem]]:
     md = markdown or ""
     h = html or ""
 
@@ -921,10 +1002,6 @@ class PostgresWriter:
                     (doc_id, (page.title or "")[:255], content, page.url),
                 )
 
-                # Sync media: on rerun, replace old rows for this page (no append).
-                cur.execute("DELETE FROM storage_image WHERE storage_id = %s;", (doc_id,))
-                cur.execute("DELETE FROM storage_video WHERE storage_id = %s;", (doc_id,))
-
                 if page.images:
                     cur.executemany(
                         """
@@ -957,6 +1034,7 @@ class PostgresWriter:
                     )
             conn.commit()
 
+
 class CrawlState:
     """
     Append-only event log to support resume after stop.
@@ -969,7 +1047,13 @@ class CrawlState:
         self.events_path = self.state_dir / events_filename
         self._lock = asyncio.Lock()
 
-    async def record(self, event_type: str, url: str, ok: Optional[bool] = None, error: Optional[str] = None) -> None:
+    async def record(
+        self,
+        event_type: str,
+        url: str,
+        ok: Optional[bool] = None,
+        error: Optional[str] = None,
+    ) -> None:
         rec: dict[str, object] = {"ts": _now_iso(), "type": event_type, "url": url}
         if ok is not None:
             rec["ok"] = bool(ok)
@@ -1057,7 +1141,9 @@ class CrawlAIBenhVienScraper:
         self.crawler = None
         self.db_writer = PostgresWriter()
         # Use a separate state file for DB mode so old file-export runs don't block re-crawling.
-        self.state = CrawlState(output_root=self.output_root, events_filename="events_db.jsonl")
+        self.state = CrawlState(
+            output_root=self.output_root, events_filename="events_db.jsonl"
+        )
 
         self.visited_urls: set[str] = set()  # done_ok only
         self.failed_urls: set[str] = set()
@@ -1077,7 +1163,9 @@ class CrawlAIBenhVienScraper:
     def _is_allowed(self, url: str) -> bool:
         return is_related_domain(url, self.base_domain, self.allow_domains)
 
-    async def _crawl_one(self, url: str) -> tuple[Optional[PageItem], list[str], Optional[str]]:
+    async def _crawl_one(
+        self, url: str
+    ) -> tuple[Optional[PageItem], list[str], Optional[str]]:
         if url in self.visited_urls:
             return None, [], None
         if self.max_pages and len(self.visited_urls) >= self.max_pages:
@@ -1088,7 +1176,9 @@ class CrawlAIBenhVienScraper:
             return None, [], "already_processing"
 
         self.processing_urls.add(url)
-        logger.info(f"Crawling: {url} ({len(self.visited_urls)}/{self.max_pages or '∞'})")
+        logger.info(
+            f"Crawling: {url} ({len(self.visited_urls)}/{self.max_pages or '∞'})"
+        )
 
         try:
             if CrawlerRunConfig is not None:
@@ -1107,21 +1197,34 @@ class CrawlAIBenhVienScraper:
             markdown = getattr(result, "markdown", "") or ""
             html = getattr(result, "html", "") or ""
 
-            title = extract_title_from_markdown(markdown) or extract_title_from_html(html) or url
+            title = (
+                extract_title_from_markdown(markdown)
+                or extract_title_from_html(html)
+                or url
+            )
             entry_html = extract_main_content_html(html) or html
 
-            md_no_menu = strip_navigation_menu_from_markdown(markdown) if markdown else ""
-            images, videos = extract_media(md_no_menu, entry_html, url)
+            md_for_media = (
+                strip_navigation_menu_from_markdown(markdown) if markdown else ""
+            )
+            images, videos = extract_media(md_for_media, entry_html, url)
 
-            # Content: keep Markdown (including in-content navigation/tab URLs).
-            # Only strip site-level header/menu noise and media embeds.
-            content_md = strip_media_from_markdown(md_no_menu).strip() if md_no_menu else ""
-            if html:
-                content_md = strip_header_wrapper_from_content(content_md, html).strip()
+            # Content: ưu tiên vùng main content; nếu không có thì lấy toàn bộ trang (full HTML -> text)
+            if entry_html:
+                t = _HTMLTextExtractor()
+                try:
+                    t.feed(entry_html)
+                    t.close()
+                    content_md = t.text()
+                except Exception:
+                    content_md = ""
+            else:
+                content_md = ""
 
             if not content_md.strip() and html:
-                # Final fallback: extract body text (may lose URLs, but only when markdown is empty).
-                content_md = strip_header_wrapper_from_content("", html).strip() or html.strip()
+                content_md = (
+                    strip_header_wrapper_from_content("", html).strip() or html.strip()
+                )
 
             item = PageItem(
                 url=url,
@@ -1214,11 +1317,16 @@ class CrawlAIBenhVienScraper:
                             await self.db_writer.write(item)
                         except Exception as e:
                             self.failed_urls.add(url)
-                            await self.state.record("done", url, ok=False, error=f"db_write_error: {e}")
+                            await self.state.record(
+                                "done", url, ok=False, error=f"db_write_error: {e}"
+                            )
                         else:
                             self.visited_urls.add(url)
                             await self.state.record("done", url, ok=True)
-                            if self.max_pages and len(self.visited_urls) >= self.max_pages:
+                            if (
+                                self.max_pages
+                                and len(self.visited_urls) >= self.max_pages
+                            ):
                                 stop_event.set()
                     elif err:
                         self.failed_urls.add(url)
@@ -1251,7 +1359,9 @@ class CrawlAIBenhVienScraper:
 
             print("\n=== Crawl4AI Summary ===")
             print(f"Total URLs visited: {len(self.visited_urls)}")
-            print("Exported to Postgres tables: storage_data, storage_image, storage_video")
+            print(
+                "Exported to Postgres tables: storage_data, storage_image, storage_video"
+            )
         except Exception as e:
             logger.error(f"Fatal error: {e}")
 
