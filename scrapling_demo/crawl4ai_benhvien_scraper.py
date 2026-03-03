@@ -2,6 +2,8 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
+import os
 import re
 import uuid
 from html import unescape
@@ -9,6 +11,9 @@ from html.parser import HTMLParser
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
 from typing import Iterable, Optional
 from urllib.parse import ParseResult, parse_qs, urlencode, urljoin, urlparse, urlunparse
 
@@ -962,6 +967,8 @@ class PostgresWriter:
 
         self.cfg = load_postgres_config()
         self._sem = asyncio.Semaphore(2)  # limit concurrent DB writes
+        self._embed_lock = Lock()
+        self._embed_cache: dict[str, str] = {}  # key=sha1(text), val=pgvector literal "[..]"
 
     async def start(self) -> None:
         if psycopg is None:
@@ -984,22 +991,199 @@ class PostgresWriter:
     def _media_id(doc_id: uuid.UUID, kind: str, media_url: str) -> uuid.UUID:
         return uuid.uuid5(uuid.NAMESPACE_URL, f"{doc_id}|{kind}|{media_url}")
 
+    @staticmethod
+    def _embedding_text(title: str, content: str, url: str) -> str:
+        t = (title or "").strip()
+        c = (content or "").strip()
+        u = (url or "").strip()
+        parts = [p for p in (t, c, u) if p]
+        s = "\n\n".join(parts).strip()
+        # keep bounded to avoid overly large embedding requests / payload
+        # (Ollama embedding can 500 on very long inputs depending on model/build)
+        max_chars = int((os.getenv("OLLAMA_MAX_CHARS") or "").strip() or "4000")
+        return s[: max(200, max_chars)]
+
+    @staticmethod
+    def _hash_embedding(text: str, dim: int = 1536) -> list[float]:
+        """
+        Deterministic fallback embedding (not semantic).
+        Useful to always populate pgvector column during development.
+        """
+        seed = (text or "").encode("utf-8", errors="ignore")
+        out: list[float] = []
+        counter = 0
+        while len(out) < dim:
+            h = hashlib.sha256(seed + b"|" + str(counter).encode("ascii")).digest()
+            counter += 1
+            # 32 bytes -> 8 floats
+            for i in range(0, 32, 4):
+                u = int.from_bytes(h[i : i + 4], "big", signed=False)
+                # map to [-1, 1]
+                out.append((u / 2**32) * 2.0 - 1.0)
+                if len(out) >= dim:
+                    break
+        return out
+
+    @staticmethod
+    def _vector_literal(vec: list[float], dim: int = 1536) -> str:
+        v = vec or []
+        if len(v) != dim:
+            if len(v) > dim:
+                v = v[:dim]
+            else:
+                v = v + [0.0] * (dim - len(v))
+        parts: list[str] = []
+        for x in v:
+            try:
+                fx = float(x)
+            except Exception:
+                fx = 0.0
+            if not math.isfinite(fx):
+                fx = 0.0
+            parts.append(format(fx, ".10g"))
+        return "[" + ",".join(parts) + "]"
+
+    class OllamaEmbeddingError(RuntimeError):
+        pass
+
+    @staticmethod
+    def _ollama_embedding(text: str) -> list[float]:
+        """
+        Get embedding from Ollama.
+
+        Supports both endpoints:
+          - POST /api/embed        -> {"embeddings":[[...]]}
+          - POST /api/embeddings   -> {"embedding":[...]}
+        """
+        host = (os.getenv("OLLAMA_HOST") or "").strip() or "192.168.1.66:11434"
+        if not re.match(r"^https?://", host, flags=re.IGNORECASE):
+            host = "http://" + host
+        model = (
+            (os.getenv("OLLAMA_EMBED_MODEL") or "").strip()
+            or "nomic-embed-text:latest"
+        )
+        timeout_s = float((os.getenv("OLLAMA_TIMEOUT_S") or "").strip() or "60")
+        base = host.rstrip("/")
+
+        def _post(url: str, payload: dict) -> dict:
+            data = json.dumps(payload).encode("utf-8")
+            req = Request(
+                url=url,
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urlopen(req, timeout=timeout_s) as resp:
+                    raw = resp.read()
+            except HTTPError as e:
+                try:
+                    body = e.read()
+                    body_s = body.decode("utf-8", errors="ignore").strip()
+                except Exception:
+                    body_s = ""
+                extra = f" body={body_s[:800]}" if body_s else ""
+                raise PostgresWriter.OllamaEmbeddingError(
+                    f"Ollama request failed: {url} (HTTP {getattr(e, 'code', '?')}){extra}"
+                ) from e
+            except (URLError, TimeoutError) as e:
+                raise PostgresWriter.OllamaEmbeddingError(
+                    f"Ollama request failed: {url} ({e})"
+                ) from e
+            except Exception as e:
+                raise PostgresWriter.OllamaEmbeddingError(
+                    f"Ollama request failed: {url} ({e})"
+                ) from e
+            try:
+                return json.loads(raw.decode("utf-8", errors="ignore"))
+            except Exception as e:
+                raise PostgresWriter.OllamaEmbeddingError(
+                    f"Ollama returned non-JSON from {url}"
+                ) from e
+
+        # Preferred newer API
+        first_err: PostgresWriter.OllamaEmbeddingError | None = None
+        try:
+            r = _post(f"{base}/api/embed", {"model": model, "input": [text]})
+            embs = r.get("embeddings")
+            if isinstance(embs, list) and embs and isinstance(embs[0], list):
+                return [float(x) for x in embs[0]]
+            raise PostgresWriter.OllamaEmbeddingError(
+                "Ollama /api/embed response missing 'embeddings' field"
+            )
+        except PostgresWriter.OllamaEmbeddingError as e:
+            first_err = e
+        except Exception as e:
+            first_err = PostgresWriter.OllamaEmbeddingError(
+                f"Ollama embed parse failed: {base}/api/embed ({e})"
+            )
+
+        # Fallback older API
+        try:
+            r2 = _post(f"{base}/api/embeddings", {"model": model, "prompt": text})
+            emb = r2.get("embedding")
+            if isinstance(emb, list) and emb:
+                return [float(x) for x in emb]
+            raise PostgresWriter.OllamaEmbeddingError(
+                "Ollama embedding response missing 'embedding(s)' field"
+            )
+        except PostgresWriter.OllamaEmbeddingError as e2:
+            if first_err is not None:
+                raise PostgresWriter.OllamaEmbeddingError(
+                    f"{e2} ; previous: {first_err}"
+                ) from e2
+            raise
+
+    def _create_embedding_literal(self, text: str) -> str:
+        provider = (os.getenv("EMBEDDING_PROVIDER") or "").strip().lower()
+        if not provider:
+            provider = "ollama"
+
+        key = hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
+        with self._embed_lock:
+            cached = self._embed_cache.get(key)
+        if cached:
+            return cached
+
+        vec: list[float]
+        if provider == "none":
+            vec = [0.0] * 1536
+        elif provider == "hash":
+            vec = self._hash_embedding(text, dim=1536)
+        elif provider == "ollama":
+            # STRICT: if Ollama fails, raise to stop the crawl (no fallback)
+            vec = self._ollama_embedding(text)
+        else:
+            # unknown provider -> safe fallback
+            vec = self._hash_embedding(text, dim=1536)
+
+        lit = self._vector_literal(vec, dim=1536)
+        with self._embed_lock:
+            # simple bound to avoid unbounded growth
+            if len(self._embed_cache) > 5000:
+                self._embed_cache.clear()
+            self._embed_cache[key] = lit
+        return lit
+
     def _upsert_page(self, page: PageItem) -> None:
         doc_id = self._doc_id_from_url(page.url)
         content = (page.markdown or "").strip()
+        embed_text = self._embedding_text(page.title or "", content, page.url)
+        embedding_lit = self._create_embedding_literal(embed_text) if embed_text else self._vector_literal([0.0] * 1536, dim=1536)
 
         with psycopg.connect(self.cfg.dsn) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO storage_data (id, title, content, link)
-                    VALUES (%s, %s, %s, %s)
+                    INSERT INTO storage_data (id, title, content, link, embedding)
+                    VALUES (%s, %s, %s, %s, %s::vector)
                     ON CONFLICT (id) DO UPDATE
                       SET title = EXCLUDED.title,
                           content = EXCLUDED.content,
-                          link = EXCLUDED.link;
+                          link = EXCLUDED.link,
+                          embedding = EXCLUDED.embedding;
                     """,
-                    (doc_id, (page.title or "")[:255], content, page.url),
+                    (doc_id, (page.title or "")[:255], content, page.url, embedding_lit),
                 )
 
                 if page.images:
@@ -1295,8 +1479,10 @@ class CrawlAIBenhVienScraper:
             await self.state.record("enqueue", start)
 
         stop_event = asyncio.Event()
+        fatal_exc: Exception | None = None
 
         async def worker(worker_id: int):
+            nonlocal fatal_exc
             while True:
                 try:
                     url = await asyncio.wait_for(q.get(), timeout=2.0)
@@ -1316,6 +1502,18 @@ class CrawlAIBenhVienScraper:
                         try:
                             await self.db_writer.write(item)
                         except Exception as e:
+                            if isinstance(e, PostgresWriter.OllamaEmbeddingError):
+                                stop_event.set()
+                                if fatal_exc is None:
+                                    fatal_exc = e
+                                self.failed_urls.add(url)
+                                await self.state.record(
+                                    "done",
+                                    url,
+                                    ok=False,
+                                    error=f"fatal_embedding_error: {e}",
+                                )
+                                return
                             self.failed_urls.add(url)
                             await self.state.record(
                                 "done", url, ok=False, error=f"db_write_error: {e}"
@@ -1348,6 +1546,8 @@ class CrawlAIBenhVienScraper:
         for w in workers:
             w.cancel()
         await asyncio.gather(*workers, return_exceptions=True)
+        if fatal_exc is not None:
+            raise fatal_exc
 
     async def run(self):
         try:
