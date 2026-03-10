@@ -69,14 +69,14 @@ def _ollama_embed(base_url: str, model: str, text: str, timeout_s: int) -> list[
     return [float(x) for x in emb]
 
 
-def _get_columns(cur, table: str) -> dict[str, dict[str, Any]]:
+def _get_columns(cur, *, schema: str, table: str) -> dict[str, dict[str, Any]]:
     cur.execute(
         """
         SELECT column_name, data_type, udt_name, is_nullable
         FROM information_schema.columns
-        WHERE table_schema = 'public' AND table_name = %s
+        WHERE table_schema = %s AND table_name = %s
         """,
-        (table,),
+        (schema, table),
     )
     return {
         name: {"data_type": dt, "udt_name": udt, "is_nullable": nullable}
@@ -95,6 +95,7 @@ def _pick_text_column(cols: dict[str, dict[str, Any]]) -> str:
 
 def _ensure_embedding_column(
     cur,
+    schema: str,
     table: str,
     cols: dict[str, dict[str, Any]],
     embedding_col: str,
@@ -114,7 +115,7 @@ def _ensure_embedding_column(
     if embedding_col not in cols:
         cur.execute(
             sql.SQL("ALTER TABLE {} ADD COLUMN {} VECTOR(%s);").format(
-                sql.Identifier(table),
+                sql.Identifier(schema, table),
                 sql.Identifier(embedding_col),
             ),
             (dim,),
@@ -123,23 +124,23 @@ def _ensure_embedding_column(
     if metadata_col and metadata_col not in cols:
         cur.execute(
             sql.SQL("ALTER TABLE {} ADD COLUMN {} JSONB;").format(
-                sql.Identifier(table),
+                sql.Identifier(schema, table),
                 sql.Identifier(metadata_col),
             )
         )
 
-    cols = _get_columns(cur, table)
+    cols = _get_columns(cur, schema=schema, table=table)
     return cols[embedding_col]
 
 
 def _iter_pending_rows(
-    cur, table: str, id_col: str, text_col: str, embedding_col: str, limit: int
+    cur, *, schema: str, table: str, id_col: str, text_col: str, embedding_col: str, limit: int
 ):
     cur.execute(
         sql.SQL("SELECT {}, {} FROM {} WHERE {} IS NULL LIMIT %s").format(
             sql.Identifier(id_col),
             sql.Identifier(text_col),
-            sql.Identifier(table),
+            sql.Identifier(schema, table),
             sql.Identifier(embedding_col),
         ),
         (limit,),
@@ -149,6 +150,7 @@ def _iter_pending_rows(
 
 def _update_embeddings(
     cur,
+    schema: str,
     table: str,
     id_col: str,
     embedding_col: str,
@@ -166,7 +168,7 @@ def _update_embeddings(
                 for row_id, vec in updates
             ]
             q = sql.SQL("UPDATE {} SET {} = %s::vector, {} = %s WHERE {} = %s").format(
-                sql.Identifier(table),
+                sql.Identifier(schema, table),
                 sql.Identifier(embedding_col),
                 sql.Identifier(metadata_col),
                 sql.Identifier(id_col),
@@ -174,7 +176,7 @@ def _update_embeddings(
         else:
             params = [(_vector_to_pgvector_text(vec, dim), row_id) for row_id, vec in updates]
             q = sql.SQL("UPDATE {} SET {} = %s::vector WHERE {} = %s").format(
-                sql.Identifier(table),
+                sql.Identifier(schema, table),
                 sql.Identifier(embedding_col),
                 sql.Identifier(id_col),
             )
@@ -183,7 +185,7 @@ def _update_embeddings(
 
     if metadata_col:
         q = sql.SQL("UPDATE {} SET {} = %s, {} = %s WHERE {} = %s").format(
-            sql.Identifier(table),
+            sql.Identifier(schema, table),
             sql.Identifier(embedding_col),
             sql.Identifier(metadata_col),
             sql.Identifier(id_col),
@@ -191,7 +193,7 @@ def _update_embeddings(
         params = [(vec, Json(metadata), row_id) for row_id, vec in updates]
     else:
         q = sql.SQL("UPDATE {} SET {} = %s WHERE {} = %s").format(
-            sql.Identifier(table),
+            sql.Identifier(schema, table),
             sql.Identifier(embedding_col),
             sql.Identifier(id_col),
         )
@@ -202,6 +204,11 @@ def _update_embeddings(
 def main() -> int:
     p = argparse.ArgumentParser(
         description="Generate embeddings for Postgres table using Ollama embeddings API."
+    )
+    p.add_argument(
+        "--schema",
+        default="public",
+        help="Postgres schema name (default: public). Example: --schema n8n",
     )
     p.add_argument(
         "--table",
@@ -263,14 +270,16 @@ def main() -> int:
     conn = psycopg2.connect(cfg.dsn)
     cur = conn.cursor()
     try:
-        cols = _get_columns(cur, args.table)
+        schema = (args.schema or "public").strip() or "public"
+        cols = _get_columns(cur, schema=schema, table=args.table)
         if not cols:
-            raise SystemExit(f"Không tìm thấy bảng public.{args.table}.")
+            raise SystemExit(f"Không tìm thấy bảng {schema}.{args.table}.")
 
         text_col = _pick_text_column(cols)
         metadata_col = (args.metadata_col or "").strip() or None
         embedding_meta = _ensure_embedding_column(
             cur,
+            schema,
             args.table,
             cols,
             args.embedding_col,
@@ -291,11 +300,12 @@ def main() -> int:
             rows = list(
                 _iter_pending_rows(
                     cur,
-                    args.table,
-                    args.id_col,
-                    text_col,
-                    args.embedding_col,
-                    args.batch_size,
+                    schema=schema,
+                    table=args.table,
+                    id_col=args.id_col,
+                    text_col=text_col,
+                    embedding_col=args.embedding_col,
+                    limit=args.batch_size,
                 )
             )
             if not rows:
@@ -343,6 +353,7 @@ def main() -> int:
 
             _update_embeddings(
                 cur,
+                schema,
                 args.table,
                 args.id_col,
                 args.embedding_col,

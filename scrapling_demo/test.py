@@ -8,25 +8,27 @@ except Exception:
 import uuid
 
 
-def _require_tables(cur) -> None:
+def _require_tables(cur, *, schema: str) -> None:
     cur.execute(
         """
         SELECT table_name
         FROM information_schema.tables
-        WHERE table_schema = 'public'
+        WHERE table_schema = %s
           AND table_name IN ('storage_data', 'storage_image', 'storage_video')
         ORDER BY table_name;
-        """
+        """,
+        (schema,),
     )
     tables = [r[0] for r in cur.fetchall()]
     missing = sorted(set(["storage_data", "storage_image", "storage_video"]) - set(tables))
     if missing:
-        raise SystemExit(f"Thiếu bảng: {missing}. Hãy CREATE TABLE trước rồi test lại.")
+        raise SystemExit(f"Thiếu bảng trong schema {schema!r}: {missing}. Hãy CREATE TABLE trước rồi test lại.")
 
 
 def main():
     cfg = load_postgres_config()
     dsn = cfg.dsn
+    schema = getattr(cfg, "schema", None) or "public"
     try:
         import psycopg
     except ImportError:
@@ -37,13 +39,15 @@ def main():
 
     with psycopg.connect(dsn) as conn:
         with conn.cursor() as cur:
+            # Ensure we can resolve unqualified table names in non-public schemas
+            cur.execute('SET search_path TO "{}";'.format(str(schema).replace('"', '""')))
             cur.execute("SELECT 1, current_database(), current_user, version();")
             print("OK:", cur.fetchone())
             cur.execute("SHOW server_version;")
             print("server_version:", cur.fetchone()[0])
 
             # Match crawler assumptions: tables exist
-            _require_tables(cur)
+            _require_tables(cur, schema=schema)
             print("Tables OK: storage_data, storage_image, storage_video")
 
             # Smoke test write path (insert+delete) using deterministic UUID from URL

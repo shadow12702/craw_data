@@ -45,11 +45,12 @@ REQUIRED_COLUMNS: tuple[tuple[str, str], ...] = (
 )
 
 
-def _ensure_schema(cur, table: str) -> None:
+def _ensure_schema(cur, *, schema: str, table: str) -> None:
     """
     Tạo bảng nếu chưa có, và đảm bảo các cột tối thiểu tồn tại.
     An toàn khi chạy nhiều lần.
     """
+    cur.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {};").format(sql.Identifier(schema)))
     cur.execute(
         sql.SQL(
             """
@@ -68,26 +69,26 @@ def _ensure_schema(cur, table: str) -> None:
                 symptom_group TEXT
             );
             """
-        ).format(sql.Identifier(table))
+        ).format(sql.Identifier(schema, table))
     )
     for col, col_type in REQUIRED_COLUMNS:
         cur.execute(
             sql.SQL("ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} {};").format(
-                sql.Identifier(table),
+                sql.Identifier(schema, table),
                 sql.Identifier(col),
                 sql.SQL(col_type),
             )
         )
 
 
-def _get_table_columns(cur, table: str) -> dict[str, dict[str, Any]]:
+def _get_table_columns(cur, *, schema: str, table: str) -> dict[str, dict[str, Any]]:
     cur.execute(
         """
         SELECT column_name, data_type, udt_name, is_nullable, column_default
         FROM information_schema.columns
-        WHERE table_schema = 'public' AND table_name = %s
+        WHERE table_schema = %s AND table_name = %s
         """,
-        (table,),
+        (schema, table),
     )
     return {
         name: {
@@ -100,13 +101,15 @@ def _get_table_columns(cur, table: str) -> dict[str, dict[str, Any]]:
     }
 
 
-def _make_insert_sql(table: str, columns: Sequence[str]) -> sql.Composed:
+def _make_insert_sql(*, schema: str, table: str, columns: Sequence[str]) -> sql.Composed:
     cols = sql.SQL(", ").join(sql.Identifier(c) for c in columns)
-    return sql.SQL("INSERT INTO {} ({}) VALUES %s").format(sql.Identifier(table), cols)
+    return sql.SQL("INSERT INTO {} ({}) VALUES %s").format(sql.Identifier(schema, table), cols)
 
 
-def _make_upsert_sql(table: str, columns: Sequence[str], conflict_col: str) -> sql.Composed:
-    base = _make_insert_sql(table, columns)
+def _make_upsert_sql(
+    *, schema: str, table: str, columns: Sequence[str], conflict_col: str
+) -> sql.Composed:
+    base = _make_insert_sql(schema=schema, table=table, columns=columns)
     update_cols = [c for c in columns if c != conflict_col]
     if not update_cols:
         return base
@@ -253,6 +256,11 @@ def main() -> int:
         description="Import Dataset_Trieu_Chung JSON into Postgres."
     )
     parser.add_argument(
+        "--schema",
+        default="public",
+        help="Postgres schema name (default: public). Example: --schema n8n",
+    )
+    parser.add_argument(
         "--json-path",
         default=None,
         help="Path to JSON file (default: auto pick Dataset_Trieu_Chung.json if exists).",
@@ -301,10 +309,11 @@ def main() -> int:
     conn = psycopg2.connect(cfg.dsn)
     cur = conn.cursor()
     try:
-        _ensure_schema(cur, args.table)
+        schema = (args.schema or "public").strip() or "public"
+        _ensure_schema(cur, schema=schema, table=args.table)
         conn.commit()
 
-        table_cols = _get_table_columns(cur, args.table)
+        table_cols = _get_table_columns(cur, schema=schema, table=args.table)
         # Only insert columns that actually exist in the table.
         # If table has UUID id, we always include it so the import is idempotent (upsert).
         insert_cols: list[str] = [c for c, _ in REQUIRED_COLUMNS if c in table_cols]
@@ -324,9 +333,11 @@ def main() -> int:
 
         # Prefer upsert when we can provide stable UUID ids.
         if "id" in insert_cols:
-            insert_sql = _make_upsert_sql(args.table, insert_cols, "id")
+            insert_sql = _make_upsert_sql(
+                schema=schema, table=args.table, columns=insert_cols, conflict_col="id"
+            )
         else:
-            insert_sql = _make_insert_sql(args.table, insert_cols)
+            insert_sql = _make_insert_sql(schema=schema, table=args.table, columns=insert_cols)
 
         rows = list(_iter_rows(data, insert_cols, table_cols))
         # When using ON CONFLICT (id), all proposed rows in a single statement must have unique ids.

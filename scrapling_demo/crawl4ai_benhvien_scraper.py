@@ -1104,6 +1104,9 @@ class PostgresWriter:
 
         with psycopg.connect(self.cfg.dsn) as conn:
             with conn.cursor() as cur:
+                # Make sure we can work with non-public schemas (e.g. n8n)
+                schema = getattr(self.cfg, "schema", None) or "public"
+                cur.execute('SET search_path TO "{}";'.format(str(schema).replace('"', '""')))
                 cur.execute(
                     """
                     INSERT INTO storage_data (id, title, content, link)

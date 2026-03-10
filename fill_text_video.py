@@ -12,14 +12,14 @@ from psycopg2.extras import execute_values, register_uuid
 from scrapling_demo.db_config import load_postgres_config
 
 
-def _get_columns(cur, table: str) -> set[str]:
+def _get_columns(cur, *, schema: str, table: str) -> set[str]:
     cur.execute(
         """
         SELECT column_name
         FROM information_schema.columns
-        WHERE table_schema = 'public' AND table_name = %s
+        WHERE table_schema = %s AND table_name = %s
         """,
-        (table,),
+        (schema, table),
     )
     return {r[0] for r in cur.fetchall()}
 
@@ -51,6 +51,7 @@ def fill_text_video_from_excel(
     sheet_name: str | int | None,
     excel_storage_id_col: str,
     excel_text_col: str,
+    schema: str,
     table: str,
     key_col: str,
     target_col: str,
@@ -106,13 +107,13 @@ def fill_text_video_from_excel(
     register_uuid(conn_or_curs=conn)
     cur = conn.cursor()
     try:
-        cols = _get_columns(cur, table)
+        cols = _get_columns(cur, schema=schema, table=table)
         if not cols:
-            raise RuntimeError(f"Table public.{table} not found.")
+            raise RuntimeError(f"Table {schema}.{table} not found.")
         missing_cols = [c for c in (key_col, target_col) if c not in cols]
         if missing_cols:
             raise RuntimeError(
-                f"Table public.{table} missing columns: {missing_cols}. Existing: {sorted(cols)}"
+                f"Table {schema}.{table} missing columns: {missing_cols}. Existing: {sorted(cols)}"
             )
 
         update_query = sql.SQL(
@@ -123,7 +124,7 @@ def fill_text_video_from_excel(
             WHERE sv.{key_col} = data.{key_col}
             """
         ).format(
-            table=sql.Identifier(table),
+            table=sql.Identifier(schema, table),
             key_col=sql.Identifier(key_col),
             target_col=sql.Identifier(target_col),
         )
@@ -182,6 +183,11 @@ def main() -> int:
         default="text_video",
         help="Excel column name for text_video (default: text_video)",
     )
+    p.add_argument(
+        "--schema",
+        default="public",
+        help="Postgres schema name (default: public). Example: --schema n8n",
+    )
     p.add_argument("--table", default="storage_video", help="Target table (default: storage_video)")
     p.add_argument(
         "--key-col",
@@ -226,6 +232,7 @@ def main() -> int:
         sheet_name=sheet,
         excel_storage_id_col=args.excel_storage_id_col,
         excel_text_col=args.excel_text_col,
+        schema=(args.schema or "public").strip() or "public",
         table=args.table,
         key_col=args.key_col,
         target_col=args.target_col,

@@ -10,6 +10,7 @@ class PostgresConfig:
     username: str
     password: str
     sslmode: str = "prefer"
+    schema: str = "n8n"
 
     @property
     def dsn(self) -> str:
@@ -24,12 +25,13 @@ POSTGRES_CONFIG = PostgresConfig(
     # NOTE:
     # - Inside Docker network: host is usually "pgvector"
     # - From Windows host (outside Docker): use Docker host IP or localhost (because ports: "5432:5432")
-    host="192.168.1.66",
+    host="192.168.200.66",
     port=5432,
-    database="postgres",
+    database="n8n",
     username="n8n",
-    password="n8n",
+    password="123456",
     sslmode="prefer",
+    schema="n8n",
 )
 
 
@@ -146,18 +148,19 @@ def migrate_youtube_embed_urls_to_watch() -> None:
             cur.close()
         conn.close()
 
+
 # Server DB
 DB_HOST = "192.168.200.66"
 DB_PORT = 5050  # PostgreSQL mặc định; nếu DB chạy ở 5050 thì đổi thành 5050
 DB_NAME = "n8n"  # tên database, đổi nếu dùng DB khác
 DB_USER = "n8n"
 DB_PASSWORD = "123456"
+DB_SCHEMA = "n8n"  # đổi thành "n8n" nếu bạn dùng schema n8n (không phải public)
+
 
 # Connection string (để dùng với psycopg2 hoặc SQLAlchemy)
 def get_connection_string():
-    return (
-        f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-    )
+    return f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
 
 def get_connection():
@@ -166,13 +169,24 @@ def get_connection():
         import psycopg2
     except ImportError:
         raise ImportError("Cần cài: pip install psycopg2-binary")
-    return psycopg2.connect(
+    conn = psycopg2.connect(
         host=DB_HOST,
         port=DB_PORT,
         dbname=DB_NAME,
         user=DB_USER,
         password=DB_PASSWORD,
     )
+    # Ensure unqualified table names resolve to desired schema
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                'SET search_path TO "{}";'.format(str(DB_SCHEMA).replace('"', '""'))
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return conn
 
 
 def create_tables_if_not_exist():
@@ -192,6 +206,7 @@ def create_tables_if_not_exist():
 
 if __name__ == "__main__":
     import sys
+
     if len(sys.argv) > 1 and sys.argv[1] == "create":
         create_tables_if_not_exist()
     elif len(sys.argv) > 1 and sys.argv[1] == "migrate":
