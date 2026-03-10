@@ -147,11 +147,11 @@ def migrate_youtube_embed_urls_to_watch() -> None:
         conn.close()
 
 # Server DB
-DB_HOST = "192.168.1.66"
-DB_PORT = 5432  # PostgreSQL mặc định; nếu DB chạy ở 5050 thì đổi thành 5050
-DB_NAME = "postgres"  # tên database, đổi nếu dùng DB khác
+DB_HOST = "192.168.200.66"
+DB_PORT = 5050  # PostgreSQL mặc định; nếu DB chạy ở 5050 thì đổi thành 5050
+DB_NAME = "n8n"  # tên database, đổi nếu dùng DB khác
 DB_USER = "n8n"
-DB_PASSWORD = "n8n"
+DB_PASSWORD = "123456"
 
 # Connection string (để dùng với psycopg2 hoặc SQLAlchemy)
 def get_connection_string():

@@ -405,12 +405,7 @@ class _HTMLTextExtractor(HTMLParser):
 
 def extract_main_content_html(html: str) -> str:
     """
-    Trích vùng nội dung chính theo nhiều template:
-    - div.entry-content.single-page (ưu tiên)
-    - div.entry-content
-    - article
-    - main
-    - #content
+    Trích vùng nội dung chính: chỉ lấy inner HTML của `div#content`.
     """
     if not html:
         return ""
@@ -518,26 +513,140 @@ def extract_main_content_html(html: str) -> str:
         def html(self) -> str:
             return "".join(self._chunks)
 
-    candidates = [
-        dict(
-            tag="div", required_classes={"entry-content", "single-page"}, id_equals=None
-        ),
-        dict(tag="div", required_classes={"entry-content"}, id_equals=None),
-        dict(tag="article", required_classes=set(), id_equals=None),
-        dict(tag="main", required_classes=set(), id_equals=None),
-        dict(tag="div", required_classes=set(), id_equals="content"),
-    ]
+    candidates = [dict(tag="div", required_classes=set(), id_equals="content")]
     for cfg in candidates:
         p = _ElementInnerHTMLExtractor(**cfg)
         try:
             p.feed(html)
             p.close()
             out = p.html()
-            if out and len(out.strip()) > 200:
+            # Some pages may have short but valid content blocks.
+            if out and len(out.strip()) > 50:
                 return out
         except Exception:
             continue
     return ""
+
+
+class _HTMLFilterRemoveDivByClass(HTMLParser):
+    """
+    Remove unwanted <div> blocks by class substring match, while keeping other HTML intact.
+    Used before converting HTML -> text for the `content` column.
+    """
+
+    def __init__(self, banned_class_markers: Iterable[str]):
+        super().__init__(convert_charrefs=False)
+        self._banned = {str(x).lower() for x in (banned_class_markers or []) if str(x)}
+        self._skip_depth = 0
+        self._chunks: list[str] = []
+
+    @staticmethod
+    def _attrs_dict(attrs) -> dict[str, str]:
+        try:
+            return {k.lower(): (v or "") for k, v in (attrs or []) if k}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _rebuild_start(tag: str, attrs) -> str:
+        if not attrs:
+            return f"<{tag}>"
+        parts = []
+        for k, v in attrs:
+            if not k:
+                continue
+            if v is None:
+                parts.append(str(k))
+            else:
+                vv = str(v).replace('"', "&quot;")
+                parts.append(f'{k}="{vv}"')
+        return f"<{tag} {' '.join(parts)}>"
+
+    def _should_skip_div(self, attrs) -> bool:
+        if not self._banned:
+            return False
+        ad = self._attrs_dict(attrs)
+        cls = (ad.get("class") or "").lower()
+        if not cls:
+            return False
+        return any(m in cls for m in self._banned)
+
+    def handle_starttag(self, tag, attrs):
+        t = (tag or "").lower()
+        if self._skip_depth > 0:
+            self._skip_depth += 1
+            return
+        if t == "div" and self._should_skip_div(attrs):
+            self._skip_depth = 1
+            return
+        self._chunks.append(self._rebuild_start(tag, attrs))
+
+    def handle_startendtag(self, tag, attrs):
+        if self._skip_depth > 0:
+            return
+        self._chunks.append(self._rebuild_start(tag, attrs)[:-1] + " />")
+
+    def handle_endtag(self, tag):
+        if self._skip_depth > 0:
+            self._skip_depth -= 1
+            return
+        self._chunks.append(f"</{tag}>")
+
+    def handle_data(self, data):
+        if self._skip_depth > 0:
+            return
+        if data:
+            self._chunks.append(data)
+
+    def handle_entityref(self, name):
+        if self._skip_depth > 0:
+            return
+        self._chunks.append(f"&{name};")
+
+    def handle_charref(self, name):
+        if self._skip_depth > 0:
+            return
+        self._chunks.append(f"&#{name};")
+
+    def html(self) -> str:
+        return "".join(self._chunks)
+
+
+_WEBP_URL_RE = re.compile(
+    r"(?:https?://[^\s)\"']+?\.webp(?:\?[^\s)\"']*)?)",
+    flags=re.IGNORECASE,
+)
+
+# Also remove standalone filenames/captions like "TB-XYZ.webp (1920×1080)" (not URLs).
+_WEBP_FILENAME_RE = re.compile(
+    r"\b[^\s\"'<>]+?\.webp\b",
+    flags=re.IGNORECASE,
+)
+
+_IMAGE_DIMENSION_RE = re.compile(
+    r"\(\s*\d{2,5}\s*[x×]\s*\d{2,5}\s*\)",
+    flags=re.IGNORECASE,
+)
+
+
+def clean_content_text(text: str) -> str:
+    """
+    Normalize `content` text:
+    - remove any .webp URLs
+    - remove special chars: * # $ %
+    """
+    s = (text or "").strip()
+    if not s:
+        return ""
+    # remove .webp urls and also .webp filenames shown as text/caption
+    s = _WEBP_URL_RE.sub("", s)
+    s = _WEBP_FILENAME_RE.sub("", s)
+    # remove leftover dimension captions like "(1920×1080)"
+    s = _IMAGE_DIMENSION_RE.sub("", s)
+    s = re.sub(r"[*#$%]", "", s)
+    s = re.sub(r"[^\S\n]+", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s).strip()
+    return s
 
 
 class _HeaderWrapperTextExtractor(HTMLParser):
@@ -967,8 +1076,6 @@ class PostgresWriter:
 
         self.cfg = load_postgres_config()
         self._sem = asyncio.Semaphore(2)  # limit concurrent DB writes
-        self._embed_lock = Lock()
-        self._embed_cache: dict[str, str] = {}  # key=sha1(text), val=pgvector literal "[..]"
 
     async def start(self) -> None:
         if psycopg is None:
@@ -991,199 +1098,22 @@ class PostgresWriter:
     def _media_id(doc_id: uuid.UUID, kind: str, media_url: str) -> uuid.UUID:
         return uuid.uuid5(uuid.NAMESPACE_URL, f"{doc_id}|{kind}|{media_url}")
 
-    @staticmethod
-    def _embedding_text(title: str, content: str, url: str) -> str:
-        t = (title or "").strip()
-        c = (content or "").strip()
-        u = (url or "").strip()
-        parts = [p for p in (t, c, u) if p]
-        s = "\n\n".join(parts).strip()
-        # keep bounded to avoid overly large embedding requests / payload
-        # (Ollama embedding can 500 on very long inputs depending on model/build)
-        max_chars = int((os.getenv("OLLAMA_MAX_CHARS") or "").strip() or "4000")
-        return s[: max(200, max_chars)]
-
-    @staticmethod
-    def _hash_embedding(text: str, dim: int = 1536) -> list[float]:
-        """
-        Deterministic fallback embedding (not semantic).
-        Useful to always populate pgvector column during development.
-        """
-        seed = (text or "").encode("utf-8", errors="ignore")
-        out: list[float] = []
-        counter = 0
-        while len(out) < dim:
-            h = hashlib.sha256(seed + b"|" + str(counter).encode("ascii")).digest()
-            counter += 1
-            # 32 bytes -> 8 floats
-            for i in range(0, 32, 4):
-                u = int.from_bytes(h[i : i + 4], "big", signed=False)
-                # map to [-1, 1]
-                out.append((u / 2**32) * 2.0 - 1.0)
-                if len(out) >= dim:
-                    break
-        return out
-
-    @staticmethod
-    def _vector_literal(vec: list[float], dim: int = 1536) -> str:
-        v = vec or []
-        if len(v) != dim:
-            if len(v) > dim:
-                v = v[:dim]
-            else:
-                v = v + [0.0] * (dim - len(v))
-        parts: list[str] = []
-        for x in v:
-            try:
-                fx = float(x)
-            except Exception:
-                fx = 0.0
-            if not math.isfinite(fx):
-                fx = 0.0
-            parts.append(format(fx, ".10g"))
-        return "[" + ",".join(parts) + "]"
-
-    class OllamaEmbeddingError(RuntimeError):
-        pass
-
-    @staticmethod
-    def _ollama_embedding(text: str) -> list[float]:
-        """
-        Get embedding from Ollama.
-
-        Supports both endpoints:
-          - POST /api/embed        -> {"embeddings":[[...]]}
-          - POST /api/embeddings   -> {"embedding":[...]}
-        """
-        host = (os.getenv("OLLAMA_HOST") or "").strip() or "192.168.1.66:11434"
-        if not re.match(r"^https?://", host, flags=re.IGNORECASE):
-            host = "http://" + host
-        model = (
-            (os.getenv("OLLAMA_EMBED_MODEL") or "").strip()
-            or "nomic-embed-text:latest"
-        )
-        timeout_s = float((os.getenv("OLLAMA_TIMEOUT_S") or "").strip() or "60")
-        base = host.rstrip("/")
-
-        def _post(url: str, payload: dict) -> dict:
-            data = json.dumps(payload).encode("utf-8")
-            req = Request(
-                url=url,
-                data=data,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            try:
-                with urlopen(req, timeout=timeout_s) as resp:
-                    raw = resp.read()
-            except HTTPError as e:
-                try:
-                    body = e.read()
-                    body_s = body.decode("utf-8", errors="ignore").strip()
-                except Exception:
-                    body_s = ""
-                extra = f" body={body_s[:800]}" if body_s else ""
-                raise PostgresWriter.OllamaEmbeddingError(
-                    f"Ollama request failed: {url} (HTTP {getattr(e, 'code', '?')}){extra}"
-                ) from e
-            except (URLError, TimeoutError) as e:
-                raise PostgresWriter.OllamaEmbeddingError(
-                    f"Ollama request failed: {url} ({e})"
-                ) from e
-            except Exception as e:
-                raise PostgresWriter.OllamaEmbeddingError(
-                    f"Ollama request failed: {url} ({e})"
-                ) from e
-            try:
-                return json.loads(raw.decode("utf-8", errors="ignore"))
-            except Exception as e:
-                raise PostgresWriter.OllamaEmbeddingError(
-                    f"Ollama returned non-JSON from {url}"
-                ) from e
-
-        # Preferred newer API
-        first_err: PostgresWriter.OllamaEmbeddingError | None = None
-        try:
-            r = _post(f"{base}/api/embed", {"model": model, "input": [text]})
-            embs = r.get("embeddings")
-            if isinstance(embs, list) and embs and isinstance(embs[0], list):
-                return [float(x) for x in embs[0]]
-            raise PostgresWriter.OllamaEmbeddingError(
-                "Ollama /api/embed response missing 'embeddings' field"
-            )
-        except PostgresWriter.OllamaEmbeddingError as e:
-            first_err = e
-        except Exception as e:
-            first_err = PostgresWriter.OllamaEmbeddingError(
-                f"Ollama embed parse failed: {base}/api/embed ({e})"
-            )
-
-        # Fallback older API
-        try:
-            r2 = _post(f"{base}/api/embeddings", {"model": model, "prompt": text})
-            emb = r2.get("embedding")
-            if isinstance(emb, list) and emb:
-                return [float(x) for x in emb]
-            raise PostgresWriter.OllamaEmbeddingError(
-                "Ollama embedding response missing 'embedding(s)' field"
-            )
-        except PostgresWriter.OllamaEmbeddingError as e2:
-            if first_err is not None:
-                raise PostgresWriter.OllamaEmbeddingError(
-                    f"{e2} ; previous: {first_err}"
-                ) from e2
-            raise
-
-    def _create_embedding_literal(self, text: str) -> str:
-        provider = (os.getenv("EMBEDDING_PROVIDER") or "").strip().lower()
-        if not provider:
-            provider = "ollama"
-
-        key = hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
-        with self._embed_lock:
-            cached = self._embed_cache.get(key)
-        if cached:
-            return cached
-
-        vec: list[float]
-        if provider == "none":
-            vec = [0.0] * 1536
-        elif provider == "hash":
-            vec = self._hash_embedding(text, dim=1536)
-        elif provider == "ollama":
-            # STRICT: if Ollama fails, raise to stop the crawl (no fallback)
-            vec = self._ollama_embedding(text)
-        else:
-            # unknown provider -> safe fallback
-            vec = self._hash_embedding(text, dim=1536)
-
-        lit = self._vector_literal(vec, dim=1536)
-        with self._embed_lock:
-            # simple bound to avoid unbounded growth
-            if len(self._embed_cache) > 5000:
-                self._embed_cache.clear()
-            self._embed_cache[key] = lit
-        return lit
-
     def _upsert_page(self, page: PageItem) -> None:
         doc_id = self._doc_id_from_url(page.url)
         content = (page.markdown or "").strip()
-        embed_text = self._embedding_text(page.title or "", content, page.url)
-        embedding_lit = self._create_embedding_literal(embed_text) if embed_text else self._vector_literal([0.0] * 1536, dim=1536)
 
         with psycopg.connect(self.cfg.dsn) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO storage_data (id, title, content, link, embedding)
-                    VALUES (%s, %s, %s, %s, %s::vector)
+                    INSERT INTO storage_data (id, title, content, link)
+                    VALUES (%s, %s, %s, %s)
                     ON CONFLICT (id) DO UPDATE
                       SET title = EXCLUDED.title,
                           content = EXCLUDED.content,
-                          link = EXCLUDED.link,
-                          embedding = EXCLUDED.embedding;
+                          link = EXCLUDED.link;
                     """,
-                    (doc_id, (page.title or "")[:255], content, page.url, embedding_lit),
+                    (doc_id, (page.title or "")[:255], content, page.url),
                 )
 
                 if page.images:
@@ -1381,44 +1311,7 @@ class CrawlAIBenhVienScraper:
             markdown = getattr(result, "markdown", "") or ""
             html = getattr(result, "html", "") or ""
 
-            title = (
-                extract_title_from_markdown(markdown)
-                or extract_title_from_html(html)
-                or url
-            )
-            entry_html = extract_main_content_html(html) or html
-
-            md_for_media = (
-                strip_navigation_menu_from_markdown(markdown) if markdown else ""
-            )
-            images, videos = extract_media(md_for_media, entry_html, url)
-
-            # Content: ưu tiên vùng main content; nếu không có thì lấy toàn bộ trang (full HTML -> text)
-            if entry_html:
-                t = _HTMLTextExtractor()
-                try:
-                    t.feed(entry_html)
-                    t.close()
-                    content_md = t.text()
-                except Exception:
-                    content_md = ""
-            else:
-                content_md = ""
-
-            if not content_md.strip() and html:
-                content_md = (
-                    strip_header_wrapper_from_content("", html).strip() or html.strip()
-                )
-
-            item = PageItem(
-                url=url,
-                title=title,
-                markdown=content_md,
-                images=images,
-                videos=videos,
-                crawled_at=_now_iso(),
-            )
-
+            # Extract links early so we can still discover URLs even if we skip saving this page.
             raw_links: list[Optional[str]] = []
             links_obj = getattr(result, "links", None) or {}
             for bucket in ("internal", "external"):
@@ -1442,6 +1335,54 @@ class CrawlAIBenhVienScraper:
                     seen.add(u)
                     deduped.append(u)
 
+            title = (
+                extract_title_from_markdown(markdown)
+                or extract_title_from_html(html)
+                or url
+            )
+            # Content policy: only take the main block `div#content`
+            entry_html = extract_main_content_html(html)
+            if not (entry_html or "").strip():
+                # No main content container -> skip saving this page (no fallback to full-page content).
+                return None, deduped, "no_div_content"
+
+            md_for_media = (
+                strip_navigation_menu_from_markdown(markdown) if markdown else ""
+            )
+            images, videos = extract_media(md_for_media, entry_html, url)
+
+            # Content: chỉ lấy text từ `div#content`, và lọc bỏ các khối sidebar/chatbox.
+            if entry_html and entry_html.strip():
+                html_filter = _HTMLFilterRemoveDivByClass(
+                    banned_class_markers=("ft-chatbox-skin5", "slidebar", "post-sidebar")
+                )
+                try:
+                    html_filter.feed(entry_html)
+                    html_filter.close()
+                    cleaned_entry_html = html_filter.html()
+                except Exception:
+                    cleaned_entry_html = entry_html
+
+                t = _HTMLTextExtractor()
+                try:
+                    t.feed(cleaned_entry_html)
+                    t.close()
+                    content_md = t.text()
+                except Exception:
+                    content_md = ""
+            else:
+                content_md = ""
+
+            content_md = clean_content_text(content_md)
+
+            item = PageItem(
+                url=url,
+                title=title,
+                markdown=content_md,
+                images=images,
+                videos=videos,
+                crawled_at=_now_iso(),
+            )
             return item, deduped, None
         except Exception as e:
             return None, [], f"fetch_error: {e}"
@@ -1502,18 +1443,6 @@ class CrawlAIBenhVienScraper:
                         try:
                             await self.db_writer.write(item)
                         except Exception as e:
-                            if isinstance(e, PostgresWriter.OllamaEmbeddingError):
-                                stop_event.set()
-                                if fatal_exc is None:
-                                    fatal_exc = e
-                                self.failed_urls.add(url)
-                                await self.state.record(
-                                    "done",
-                                    url,
-                                    ok=False,
-                                    error=f"fatal_embedding_error: {e}",
-                                )
-                                return
                             self.failed_urls.add(url)
                             await self.state.record(
                                 "done", url, ok=False, error=f"db_write_error: {e}"
