@@ -942,6 +942,94 @@ class MediaItem:
     name: str  # caption/alt/title; "none" if missing
 
 
+def _unescape_markdown_url(url: str) -> str:
+    if not url:
+        return ""
+    # Markdown destination often escapes literal parentheses/spaces as \(...\)
+    # Keep the original URL content, only remove markdown escaping backslashes.
+    return re.sub(r"\\([()\\\s])", r"\1", url).strip()
+
+
+def _iter_markdown_image_refs(markdown: str) -> list[tuple[str, str]]:
+    md = markdown or ""
+    out: list[tuple[str, str]] = []
+    i = 0
+    n = len(md)
+
+    while i < n:
+        start = md.find("![", i)
+        if start < 0:
+            break
+
+        alt_start = start + 2
+        alt_end = alt_start
+        while alt_end < n:
+            ch = md[alt_end]
+            if ch == "\\":
+                alt_end += 2
+                continue
+            if ch == "]":
+                break
+            alt_end += 1
+        else:
+            break
+
+        pos = alt_end + 1
+        while pos < n and md[pos].isspace():
+            pos += 1
+        if pos >= n or md[pos] != "(":
+            i = start + 2
+            continue
+
+        pos += 1
+        dest_start = pos
+        depth = 1
+        while pos < n:
+            ch = md[pos]
+            if ch == "\\":
+                pos += 2
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            pos += 1
+
+        if depth != 0:
+            i = start + 2
+            continue
+
+        alt = md[alt_start:alt_end]
+        raw_dest = md[dest_start:pos].strip()
+        if raw_dest:
+            if raw_dest.startswith("<") and ">" in raw_dest:
+                raw_dest = raw_dest[1 : raw_dest.find(">")].strip()
+            else:
+                # Ignore optional markdown title after whitespace outside escapes.
+                dest_chars: list[str] = []
+                j = 0
+                while j < len(raw_dest):
+                    ch = raw_dest[j]
+                    if ch == "\\" and j + 1 < len(raw_dest):
+                        dest_chars.append(ch)
+                        dest_chars.append(raw_dest[j + 1])
+                        j += 2
+                        continue
+                    if ch.isspace():
+                        break
+                    dest_chars.append(ch)
+                    j += 1
+                raw_dest = "".join(dest_chars).strip()
+
+        if raw_dest:
+            out.append((unescape(alt).strip(), _unescape_markdown_url(raw_dest)))
+        i = pos + 1
+
+    return out
+
+
 def _is_image_url(url: str) -> bool:
     u = (url or "").lower().split("?")[0].split("#")[0]
     return any(
@@ -1003,9 +1091,8 @@ def extract_media(
     images: list[MediaItem] = []
     videos: list[MediaItem] = []
 
-    for m in re.finditer(r"!\[([^\]]*)\]\(([^)]+)\)", md):
-        alt = (m.group(1) or "").strip()
-        raw = (m.group(2) or "").strip().strip('"').strip("'")
+    for alt, raw in _iter_markdown_image_refs(md):
+        raw = (raw or "").strip().strip('"').strip("'")
         nu = normalize_url(raw, page_url)
         if not nu:
             continue

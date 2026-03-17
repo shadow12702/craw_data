@@ -19,10 +19,11 @@ except Exception:  # pragma: no cover
     psycopg = None  # type: ignore
 
 try:
-    from crawl4ai import AsyncWebCrawler, CacheMode, CrawlerRunConfig
+    from crawl4ai import AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig
 except Exception:  # pragma: no cover
     from crawl4ai import AsyncWebCrawler  # type: ignore
 
+    BrowserConfig = None  # type: ignore
     CacheMode = None  # type: ignore
     CrawlerRunConfig = None  # type: ignore
 
@@ -35,6 +36,7 @@ DEFAULT_OUTPUT_ROOT = "data_craw"
 DEFAULT_CONCURRENCY = 6
 DEFAULT_PAGE_TIMEOUT_MS = 300_000
 DEFAULT_CONNECT_ERROR_RETRY_LIMIT = 3
+DEFAULT_BROWSER_TEXT_MODE = True
 
 TABLE_DATA_BOYTE = "data_boyte"
 TABLE_IMAGE_BOYTE = "image_boyte"
@@ -47,9 +49,74 @@ MEDIA_TYPE_FILE = "file"
 
 EVENTS_FILENAME_PREFIX = "events_boyte_db"
 
-MAIN_CONTENT_TAG = "main"
-MAIN_CONTENT_ID: str | None = None
-MAIN_CONTENT_CLASS_CONTAINS: str | None = None
+# Priority order for finding the main article body and list/home content.
+# Supported selector types:
+# - ("css", "#detail-news .component-content")
+# - ("tag", "div", "detail-news", None)
+# - ("tag", "div", None, "article-content")
+ARTICLE_CONTENT_SELECTOR_CANDIDATES = (
+    ("css", "#detail-news .component-content"),
+    ("tag", "div", "detail-news", None),
+    ("tag", "div", "chitiet", None),
+    ("tag", "div", None, "article-content"),
+    ("tag", "div", None, "detail-content"),
+    ("tag", "div", None, "news-content"),
+)
+
+# Homepage/list-page fallback selectors for moh.gov.vn.
+# These are broader than article selectors and are mainly used so the crawler
+# can continue discovering follow-up links from index/category pages.
+LIST_PAGE_CONTENT_SELECTOR_CANDIDATES = (
+    ("css", "#main #content-home .main_page"),
+    ("css", "#content-home .main_page"),
+    ("css", "#content-home"),
+    ("css", "#tabstrip"),
+    ("css", "#m61424"),
+    ("css", ".main-news"),
+    ("css", ".news-grid"),
+    ("css", ".accordion-wrapper"),
+    ("tag", "div", "content-home", None),
+    ("tag", "div", "r20", None),
+    ("tag", "div", "r24", None),
+    ("tag", "div", "r25", None),
+    ("tag", "div", "r7", None),
+    ("tag", "div", "r8", None),
+    ("tag", "div", "r9", None),
+    ("tag", "div", "r10", None),
+    ("tag", "div", "r6", None),
+    ("tag", "div", "r2", None),
+    ("tag", "div", "main", None),
+    ("tag", "main", None, None),
+)
+
+DISCOVERY_SELECTOR_CANDIDATES = (
+    "#m61424 a",
+    "#tabstrip a",
+    "#content-home a",
+    "#r20 a",
+    ".main-news a",
+    ".news-grid a",
+    ".accordion-wrapper a",
+    "#r24 a",
+    "#r25 a",
+)
+
+DISCOVERY_ROOT_SELECTOR_CANDIDATES = (
+    "#main #content-home .main_page > section",
+    "#content-home .main_page > section",
+    "#content-home .main_page",
+    "#main",
+)
+
+RENDER_WAIT_FOR_SELECTOR_CANDIDATES = (
+    "#main #content-home .main_page > section a[href]",
+    "#content-home .main_page > section a[href]",
+    "#content-home .main_page a[href]",
+    "#main a[href]",
+)
+
+RENDER_WAIT_FOR_TIMEOUT_MS = 20000
+RENDER_DELAY_BEFORE_RETURN_HTML_SEC = 2.0
 
 SKIP_URL_SUBSTRINGS = ("logout", "login", "wp-admin", "/admin", "mailto:", "tel:")
 FILE_EXTENSIONS = (
@@ -178,7 +245,16 @@ def _is_retryable_connection_error(reason: Optional[str]) -> bool:
         return False
     if "crawl_failed" not in text and "fetch_error" not in text:
         return False
+    if "wait condition failed" in text or "waiting for selector" in text:
+        return False
     return any(marker in text for marker in _RETRYABLE_CONNECTION_ERROR_MARKERS)
+
+
+def _should_use_render_wait(url: str) -> bool:
+    # moh.gov.vn has proven too unstable for a required wait_for selector:
+    # pages often time out before the target block appears. We now fetch the
+    # HTML directly and rely on deep link extraction from `#main` / `.main_page`.
+    return False
 
 
 try:
@@ -215,13 +291,14 @@ except Exception:
 
 def extract_main_content_html_any_site(html: str) -> str:
     """
-    Generic default policy: only take inner HTML of the first <main>.
-    Return "" if <main> is missing/empty so the caller can skip the page.
+    Extract the main article body from the first matching selector candidate.
+    Return "" if no configured selector matches or the match is empty.
     """
     if not html:
         return ""
 
     from html.parser import HTMLParser
+    from bs4 import BeautifulSoup
 
     class _Inner(HTMLParser):
         def __init__(
@@ -308,18 +385,53 @@ def extract_main_content_html_any_site(html: str) -> str:
         def html(self) -> str:
             return "".join(self._chunks)
 
-    p = _Inner(
-        tag=MAIN_CONTENT_TAG,
-        id_equals=MAIN_CONTENT_ID,
-        class_contains=MAIN_CONTENT_CLASS_CONTAINS,
+    all_selector_candidates = (
+        ARTICLE_CONTENT_SELECTOR_CANDIDATES + LIST_PAGE_CONTENT_SELECTOR_CANDIDATES
     )
-    try:
-        p.feed(html)
-        p.close()
-        out = p.html()
-        return out if (out or "").strip() else ""
-    except Exception:
-        return ""
+
+    for selector in all_selector_candidates:
+        if not selector:
+            continue
+        selector_type = selector[0]
+        if selector_type == "css":
+            css_selector = selector[1]
+            try:
+                soup = BeautifulSoup(html, "html.parser")
+                node = soup.select_one(css_selector)
+                if node is not None:
+                    out = node.decode_contents()
+                    if (out or "").strip():
+                        logger.info(
+                            f"[HTML] Main content matched selector: {css_selector}"
+                        )
+                        return out
+            except Exception:
+                continue
+            continue
+        if selector_type == "tag":
+            _, tag, id_equals, class_contains = selector
+            p = _Inner(
+                tag=tag,
+                id_equals=id_equals,
+                class_contains=class_contains,
+            )
+            try:
+                p.feed(html)
+                p.close()
+                out = p.html()
+                if (out or "").strip():
+                    selector_desc = tag
+                    if id_equals:
+                        selector_desc += f"#{id_equals}"
+                    if class_contains:
+                        selector_desc += f".*{class_contains}*"
+                    logger.info(
+                        f"[HTML] Main content matched selector: {selector_desc}"
+                    )
+                    return out
+            except Exception:
+                continue
+    return ""
 
 
 def extract_links_from_main_html(main_html: str, page_url: str) -> list[str]:
@@ -345,6 +457,95 @@ def extract_links_from_main_html(main_html: str, page_url: str) -> list[str]:
             seen.add(u)
             deduped.append(u)
     return deduped
+
+
+def extract_links_from_selector_candidates(
+    html: str, page_url: str, selectors: tuple[str, ...]
+) -> list[str]:
+    if not html:
+        return []
+
+    from bs4 import BeautifulSoup
+
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        return []
+
+    out: list[str] = []
+    seen_href: set[str] = set()
+    for selector in selectors:
+        try:
+            nodes = soup.select(selector)
+        except Exception:
+            continue
+        for node in nodes:
+            href = unescape((node.get("href") or "").strip())
+            if not href:
+                continue
+            nu = normalize_url(href, page_url)
+            if not nu or nu in seen_href:
+                continue
+            seen_href.add(nu)
+            out.append(nu)
+    return out
+
+
+def extract_links_from_root_candidates(
+    html: str, page_url: str, root_selectors: tuple[str, ...]
+) -> list[str]:
+    if not html:
+        return []
+
+    from bs4 import BeautifulSoup
+
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        return []
+
+    out: list[str] = []
+    seen_href: set[str] = set()
+
+    def _push_href(raw_href: str) -> None:
+        href = unescape((raw_href or "").strip())
+        if not href:
+            return
+        nu = normalize_url(href, page_url)
+        if not nu or nu in seen_href:
+            return
+        seen_href.add(nu)
+        out.append(nu)
+
+    for selector in root_selectors:
+        try:
+            roots = soup.select(selector)
+        except Exception:
+            continue
+        for root in roots:
+            try:
+                for node in root.select("a[href]"):
+                    _push_href(node.get("href") or "")
+            except Exception:
+                pass
+            try:
+                raw_html = root.decode()
+                for m in re.finditer(
+                    r"""href\s*=\s*["']([^"']+)["']""",
+                    raw_html,
+                    flags=re.IGNORECASE,
+                ):
+                    _push_href(m.group(1) or "")
+            except Exception:
+                pass
+    return out
+
+
+def build_render_wait_for_condition(selectors: tuple[str, ...]) -> str:
+    cleaned = [s.strip() for s in selectors if (s or "").strip()]
+    if not cleaned:
+        return ""
+    return f"css:{', '.join(cleaned)}"
 
 
 def filter_main_html_for_content(main_html: str) -> str:
@@ -724,6 +925,29 @@ class CrawlBoYTeScraper:
                 kwargs = {"page_timeout": self.page_timeout_ms}
                 if CacheMode is not None:
                     kwargs["cache_mode"] = CacheMode.BYPASS
+                use_render_wait = _should_use_render_wait(url)
+                wait_for = (
+                    build_render_wait_for_condition(
+                        RENDER_WAIT_FOR_SELECTOR_CANDIDATES
+                    )
+                    if use_render_wait
+                    else None
+                )
+                kwargs.update(
+                    {
+                        "wait_until": "networkidle",
+                        "wait_for": wait_for,
+                        "wait_for_timeout": (
+                            RENDER_WAIT_FOR_TIMEOUT_MS if use_render_wait else None
+                        ),
+                        "delay_before_return_html": RENDER_DELAY_BEFORE_RETURN_HTML_SEC,
+                        "scan_full_page": True,
+                        "simulate_user": True,
+                        "magic": True,
+                    }
+                )
+                if use_render_wait:
+                    logger.info(f"[HTML] Render wait enabled for: {url}")
                 run_config = CrawlerRunConfig(**kwargs)
                 result = await self.crawler.arun(url=url, config=run_config)  # type: ignore[union-attr]
             else:
@@ -749,12 +973,26 @@ class CrawlBoYTeScraper:
             entry_html = filter_main_html_for_content(entry_html)
 
             discovered_main = extract_links_from_main_html(entry_html, url)
+            discovered_from_blocks = extract_links_from_selector_candidates(
+                html, url, DISCOVERY_SELECTOR_CANDIDATES
+            )
+            discovered_from_roots = extract_links_from_root_candidates(
+                html, url, DISCOVERY_ROOT_SELECTOR_CANDIDATES
+            )
             deduped: list[str] = []
-            for nu in discovered_main:
+            for nu in discovered_main + discovered_from_blocks + discovered_from_roots:
                 if not nu or not self._is_allowed(nu):
                     continue
                 if _is_crawlable_page_url(nu):
-                    deduped.append(nu)
+                    if nu not in deduped:
+                        deduped.append(nu)
+            logger.info(
+                f"[HTML] Discovered {len(deduped)} crawlable link(s) from: {url}"
+            )
+            if deduped:
+                logger.info(
+                    f"[HTML] Sample discovered URLs: {deduped[:5]}"
+                )
 
             md_for_media = (
                 strip_navigation_menu_from_markdown(markdown) if markdown else ""
@@ -911,7 +1149,17 @@ class CrawlBoYTeScraper:
             await self.state.record("enqueue", self.start_url)
             q.put_nowait(self.start_url)
 
-        async with AsyncWebCrawler() as crawler:
+        crawler_kwargs = {}
+        if BrowserConfig is not None:
+            crawler_kwargs["config"] = BrowserConfig(
+                text_mode=DEFAULT_BROWSER_TEXT_MODE,
+                light_mode=True,
+            )
+            logger.info(
+                f"[INIT] Browser text_mode={DEFAULT_BROWSER_TEXT_MODE} for stable crawl"
+            )
+
+        async with AsyncWebCrawler(**crawler_kwargs) as crawler:
             self.crawler = crawler
             workers = [
                 asyncio.create_task(self._worker(q)) for _ in range(self.concurrency)
