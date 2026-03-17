@@ -6,6 +6,8 @@ import math
 import os
 import re
 import uuid
+import io
+import sys
 from html import unescape
 from html.parser import HTMLParser
 from dataclasses import dataclass
@@ -32,6 +34,16 @@ except Exception:  # pragma: no cover
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Windows PowerShell default encoding can be cp1252/cp936 and crash on unicode output
+# from third-party libs (e.g. arrows). Force UTF-8 streams when possible.
+try:  # pragma: no cover
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+except Exception:
+    pass
 
 _SKIP_URL_CONTAINS = (
     "logout",
@@ -116,6 +128,61 @@ def normalize_url(url: str, base_url: str) -> Optional[str]:
         fragment="",
     )
     return urlunparse(normalized)
+
+
+def _is_pdf_url(url: str) -> bool:
+    try:
+        path = (urlparse(url).path or "").lower()
+    except Exception:
+        return False
+    return path.endswith(".pdf")
+
+
+def _download_url_bytes(url: str, *, timeout_s: int = 60) -> bytes:
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; benhvienanbinh-crawler/1.0)",
+            "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
+        },
+    )
+    with urlopen(req, timeout=timeout_s) as resp:
+        return resp.read()
+
+
+def extract_pdf_text_from_bytes(pdf_bytes: bytes) -> tuple[str, int]:
+    """
+    Returns (full_text, page_count).
+    Requires `pypdf` (preferred) or `PyPDF2`.
+    """
+    PdfReader = None
+    try:
+        from pypdf import PdfReader as _PdfReader  # type: ignore
+
+        PdfReader = _PdfReader
+    except Exception:
+        try:
+            from PyPDF2 import PdfReader as _PdfReader  # type: ignore
+
+            PdfReader = _PdfReader
+        except Exception:
+            PdfReader = None
+
+    if PdfReader is None:
+        raise RuntimeError("Missing PDF parser. Install: pip install pypdf")
+
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    parts: list[str] = []
+    pages = getattr(reader, "pages", []) or []
+    for p in pages:
+        try:
+            t = p.extract_text() or ""
+        except Exception:
+            t = ""
+        if t:
+            parts.append(t.strip())
+    full_text = "\n\n".join([x for x in parts if x])
+    return full_text, int(len(pages))
 
 
 def canonicalize_video_url(url: str) -> str:
@@ -1070,11 +1137,24 @@ class PostgresWriter:
 
     def __init__(self):
         try:
-            from scrapling_demo.db_config import load_postgres_config
+            from scrapling_demo.db_config import (
+                PDF_COLUMNS,
+                TABLE_PDF,
+                load_postgres_config,
+                qualified_table_name,
+            )
         except Exception:
-            from db_config import load_postgres_config  # type: ignore
+            from db_config import (  # type: ignore
+                PDF_COLUMNS,
+                TABLE_PDF,
+                load_postgres_config,
+                qualified_table_name,
+            )
 
         self.cfg = load_postgres_config()
+        self._qualified_table_name = qualified_table_name
+        self._table_pdf = TABLE_PDF
+        self._pdf_columns = PDF_COLUMNS
         self._sem = asyncio.Semaphore(2)  # limit concurrent DB writes
 
     async def start(self) -> None:
@@ -1089,6 +1169,10 @@ class PostgresWriter:
         async with self._sem:
             await asyncio.to_thread(self._upsert_page, page)
 
+    async def write_raw_pdf_url(self, pdf_url: str) -> None:
+        async with self._sem:
+            await asyncio.to_thread(self._upsert_raw_pdf_url, pdf_url)
+
     @staticmethod
     def _doc_id_from_url(url: str) -> uuid.UUID:
         # Deterministic UUID so reruns update the same record
@@ -1101,15 +1185,16 @@ class PostgresWriter:
     def _upsert_page(self, page: PageItem) -> None:
         doc_id = self._doc_id_from_url(page.url)
         content = (page.markdown or "").strip()
+        schema = getattr(self.cfg, "schema", None) or "public"
+        storage_data = self._qualified_table_name("storage_data", schema)
+        storage_image = self._qualified_table_name("storage_image", schema)
+        storage_video = self._qualified_table_name("storage_video", schema)
 
         with psycopg.connect(self.cfg.dsn) as conn:
             with conn.cursor() as cur:
-                # Make sure we can work with non-public schemas (e.g. n8n)
-                schema = getattr(self.cfg, "schema", None) or "public"
-                cur.execute('SET search_path TO "{}";'.format(str(schema).replace('"', '""')))
                 cur.execute(
-                    """
-                    INSERT INTO storage_data (id, title, content, link)
+                    f"""
+                    INSERT INTO {storage_data} (id, title, content, link)
                     VALUES (%s, %s, %s, %s)
                     ON CONFLICT (id) DO UPDATE
                       SET title = EXCLUDED.title,
@@ -1121,8 +1206,8 @@ class PostgresWriter:
 
                 if page.images:
                     cur.executemany(
-                        """
-                        INSERT INTO storage_image (id, storage_id, image_url)
+                        f"""
+                        INSERT INTO {storage_image} (id, storage_id, image_url)
                         VALUES (%s, %s, %s)
                         ON CONFLICT (id) DO NOTHING;
                         """,
@@ -1139,8 +1224,8 @@ class PostgresWriter:
                         if (v.url or "").strip()
                     ]
                     cur.executemany(
-                        """
-                        INSERT INTO storage_video (id, storage_id, video_url)
+                        f"""
+                        INSERT INTO {storage_video} (id, storage_id, video_url)
                         VALUES (%s, %s, %s)
                         ON CONFLICT (id) DO NOTHING;
                         """,
@@ -1149,6 +1234,32 @@ class PostgresWriter:
                             for v in videos
                         ],
                     )
+            conn.commit()
+
+    def _upsert_raw_pdf_url(self, pdf_url: str) -> None:
+        schema = getattr(self.cfg, "schema", None) or "public"
+        table_name = self._qualified_table_name(self._table_pdf, schema)
+        doc_id = self._doc_id_from_url(pdf_url)
+        parsed = urlparse(pdf_url)
+        file_name = Path(parsed.path or "").name or pdf_url
+        pdf_id_column = self._pdf_columns[0]
+        pdf_name_column = self._pdf_columns[1]
+        pdf_url_column = self._pdf_columns[2]
+        pdf_content_column = self._pdf_columns[3]
+
+        with psycopg.connect(self.cfg.dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    INSERT INTO {table_name} ({pdf_id_column}, {pdf_name_column}, {pdf_url_column}, {pdf_content_column})
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT ({pdf_id_column}) DO UPDATE
+                      SET {pdf_name_column} = EXCLUDED.{pdf_name_column},
+                          {pdf_url_column} = EXCLUDED.{pdf_url_column},
+                          {pdf_content_column} = EXCLUDED.{pdf_content_column};
+                    """,
+                    (doc_id, file_name, pdf_url, ""),
+                )
             conn.commit()
 
 
@@ -1235,6 +1346,11 @@ class CrawlAIBenhVienScraper:
         start_url: str = "https://benhvienanbinh.vn/",
         max_pages: Optional[int] = None,
         concurrency: int = 6,
+        pdf_concurrency: int = 2,
+        crawl_mode: str = "all",
+        crawl_pdfs: bool = False,
+        pdf_urls: Optional[list[str]] = None,
+        raw_pdf_urls: Optional[list[str]] = None,
         allow_domains: Optional[list[str]] = None,
         page_timeout_ms: int = 300_000,
         output_root: str = "data_craw",
@@ -1249,6 +1365,19 @@ class CrawlAIBenhVienScraper:
 
         self.max_pages = max_pages
         self.concurrency = max(1, int(concurrency))
+        self.pdf_concurrency = max(1, int(pdf_concurrency))
+        self.crawl_mode = (crawl_mode or "all").strip().lower()
+        if self.crawl_mode not in {"all", "pdf-only"}:
+            raise ValueError("crawl_mode must be 'all' or 'pdf-only'")
+        self.crawl_pdfs = bool(crawl_pdfs)
+        self.pdf_urls = [u.strip() for u in (pdf_urls or []) if (u or "").strip()]
+        self.raw_pdf_urls = [
+            u.strip() for u in (raw_pdf_urls or []) if (u or "").strip()
+        ]
+        self.raw_pdf_only = self.crawl_mode == "pdf-only" or bool(self.raw_pdf_urls)
+        self.discover_pdf_urls = bool(
+            self.crawl_pdfs or self.crawl_mode == "pdf-only" or self.raw_pdf_urls
+        )
         self.allow_domains = allow_domains or []
         self.page_timeout_ms = int(page_timeout_ms)
         self.output_root = output_root
@@ -1261,8 +1390,16 @@ class CrawlAIBenhVienScraper:
         self.state = CrawlState(
             output_root=self.output_root, events_filename="events_db.jsonl"
         )
+        self.pdf_state = CrawlState(
+            output_root=self.output_root, events_filename="events_pdf_db.jsonl"
+        )
+        self.raw_pdf_state = CrawlState(
+            output_root=self.output_root, events_filename="events_raw_pdf_db.jsonl"
+        )
 
         self.visited_urls: set[str] = set()  # done_ok only
+        self.visited_pdfs: set[str] = set()  # done_ok only (pdf_state)
+        self.visited_raw_pdfs: set[str] = set()  # done_ok only (raw_pdf_state)
         self.failed_urls: set[str] = set()
         self.processing_urls: set[str] = set()
         self.queued_urls: set[str] = set()
@@ -1282,19 +1419,19 @@ class CrawlAIBenhVienScraper:
 
     async def _crawl_one(
         self, url: str
-    ) -> tuple[Optional[PageItem], list[str], Optional[str]]:
+    ) -> tuple[Optional[PageItem], list[str], list[str], Optional[str]]:
         if url in self.visited_urls:
-            return None, [], None
+            return None, [], [], None
         if self.max_pages and len(self.visited_urls) >= self.max_pages:
-            return None, [], "max_pages_reached"
+            return None, [], [], "max_pages_reached"
         if not self._is_allowed(url) or self._should_skip_url(url):
-            return None, [], "not_allowed_or_skipped"
+            return None, [], [], "not_allowed_or_skipped"
         if url in self.processing_urls:
-            return None, [], "already_processing"
+            return None, [], [], "already_processing"
 
         self.processing_urls.add(url)
         logger.info(
-            f"Crawling: {url} ({len(self.visited_urls)}/{self.max_pages or '∞'})"
+            f"[HTML] Crawling: {url} ({len(self.visited_urls)}/{self.max_pages or '∞'})"
         )
 
         try:
@@ -1309,7 +1446,7 @@ class CrawlAIBenhVienScraper:
 
             if not getattr(result, "success", False):
                 msg = getattr(result, "error_message", "") or "unknown error"
-                return None, [], f"crawl_failed: {msg}"
+                return None, [], [], f"crawl_failed: {msg}"
 
             markdown = getattr(result, "markdown", "") or ""
             html = getattr(result, "html", "") or ""
@@ -1321,13 +1458,19 @@ class CrawlAIBenhVienScraper:
                 raw_links.extend(_coerce_link(x) for x in (links_obj.get(bucket) or []))
 
             discovered: list[str] = []
+            discovered_pdfs: list[str] = []
             for raw in raw_links:
                 if not raw:
                     continue
                 nu = normalize_url(raw, url)
                 if not nu:
                     continue
-                if self._is_allowed(nu) and not self._should_skip_url(nu):
+                if not self._is_allowed(nu):
+                    continue
+                if self.discover_pdf_urls and _is_pdf_url(nu):
+                    discovered_pdfs.append(nu)
+                    continue
+                if not self._should_skip_url(nu):
                     discovered.append(nu)
 
             # de-dupe preserving order
@@ -1337,6 +1480,16 @@ class CrawlAIBenhVienScraper:
                 if u not in seen:
                     seen.add(u)
                     deduped.append(u)
+            seen_pdf: set[str] = set()
+            deduped_pdfs: list[str] = []
+            for u in discovered_pdfs:
+                if u not in seen_pdf:
+                    seen_pdf.add(u)
+                    deduped_pdfs.append(u)
+            if deduped_pdfs:
+                logger.info(
+                    f"[PDF-DISCOVER] Found {len(deduped_pdfs)} PDF link(s) from: {url}"
+                )
 
             title = (
                 extract_title_from_markdown(markdown)
@@ -1347,7 +1500,7 @@ class CrawlAIBenhVienScraper:
             entry_html = extract_main_content_html(html)
             if not (entry_html or "").strip():
                 # No main content container -> skip saving this page (no fallback to full-page content).
-                return None, deduped, "no_div_content"
+                return None, deduped, deduped_pdfs, "no_div_content"
 
             md_for_media = (
                 strip_navigation_menu_from_markdown(markdown) if markdown else ""
@@ -1357,7 +1510,11 @@ class CrawlAIBenhVienScraper:
             # Content: chỉ lấy text từ `div#content`, và lọc bỏ các khối sidebar/chatbox.
             if entry_html and entry_html.strip():
                 html_filter = _HTMLFilterRemoveDivByClass(
-                    banned_class_markers=("ft-chatbox-skin5", "slidebar", "post-sidebar")
+                    banned_class_markers=(
+                        "ft-chatbox-skin5",
+                        "slidebar",
+                        "post-sidebar",
+                    )
                 )
                 try:
                     html_filter.feed(entry_html)
@@ -1386,21 +1543,100 @@ class CrawlAIBenhVienScraper:
                 videos=videos,
                 crawled_at=_now_iso(),
             )
-            return item, deduped, None
+            return item, deduped, deduped_pdfs, None
         except Exception as e:
-            return None, [], f"fetch_error: {e}"
+            return None, [], [], f"fetch_error: {e}"
         finally:
             self.processing_urls.discard(url)
+
+    async def _process_one_pdf(self, pdf_url: str, *, source_page_url: str) -> None:
+        if pdf_url in self.visited_pdfs:
+            return
+        await self.pdf_state.record("start", pdf_url)
+        try:
+            logger.info(f"[PDF-EXTRACT] Downloading: {pdf_url}")
+            pdf_bytes = await asyncio.to_thread(_download_url_bytes, pdf_url)
+            text, page_count = await asyncio.to_thread(
+                extract_pdf_text_from_bytes, pdf_bytes
+            )
+            text = clean_content_text(text)
+            title = f"PDF ({page_count} trang): {pdf_url.split('/')[-1] or pdf_url}"
+            content = (text or "").strip()
+            # Embed source page URL at top so we can trace where it was discovered.
+            if source_page_url:
+                content = (
+                    f"Nguồn: {source_page_url}\nPDF: {pdf_url}\n\n{content}".strip()
+                )
+            page = PageItem(
+                url=pdf_url,
+                title=title,
+                markdown=content,
+                images=[],
+                videos=[],
+                crawled_at=_now_iso(),
+            )
+            await self.db_writer.write(page)
+            logger.info(
+                f"[PDF-EXTRACT] Saved extracted PDF content to storage_data: {pdf_url}"
+            )
+        except Exception as e:
+            logger.error(f"[PDF-EXTRACT] Failed: {pdf_url} | {e}")
+            await self.pdf_state.record(
+                "done", pdf_url, ok=False, error=f"pdf_error: {e}"
+            )
+            return
+        self.visited_pdfs.add(pdf_url)
+        await self.pdf_state.record("done", pdf_url, ok=True)
+
+    async def _process_one_raw_pdf_url(self, pdf_url: str) -> None:
+        if pdf_url in self.visited_raw_pdfs:
+            return
+        await self.raw_pdf_state.record("start", pdf_url)
+        try:
+            logger.info(f"[PDF-RAW] Saving URL: {pdf_url}")
+            await self.db_writer.write_raw_pdf_url(pdf_url)
+        except Exception as e:
+            logger.error(f"[PDF-RAW] Failed: {pdf_url} | {e}")
+            await self.raw_pdf_state.record(
+                "done", pdf_url, ok=False, error=f"raw_pdf_db_write_error: {e}"
+            )
+            return
+        logger.info(f"[PDF-RAW] Saved URL to PDF table: {pdf_url}")
+        self.visited_raw_pdfs.add(pdf_url)
+        await self.raw_pdf_state.record("done", pdf_url, ok=True)
 
     async def crawl_site(self) -> None:
         start = normalize_url(self.start_url, self.start_url) or self.start_url
         q: asyncio.Queue[str] = asyncio.Queue()
+        pdf_q: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
+        raw_pdf_q: asyncio.Queue[str] = asyncio.Queue()
+        initial_pdf_urls: list[str] = []
+        for raw_pdf_url in self.pdf_urls:
+            pdf_url = normalize_url(raw_pdf_url, self.start_url) or raw_pdf_url
+            if not _is_pdf_url(pdf_url):
+                logger.warning(f"Skip non-PDF URL from --pdf-url: {raw_pdf_url}")
+                continue
+            initial_pdf_urls.append(pdf_url)
+        initial_raw_pdf_urls: list[str] = []
+        for raw_pdf_url in self.raw_pdf_urls:
+            pdf_url = normalize_url(raw_pdf_url, self.start_url) or raw_pdf_url
+            if not _is_pdf_url(pdf_url):
+                logger.warning(f"Skip non-PDF URL from --raw-pdf-url: {raw_pdf_url}")
+                continue
+            initial_raw_pdf_urls.append(pdf_url)
 
         if self.resume:
             enqueued, started, done_ok, done_failed = self.state.load()
             self.visited_urls = set(done_ok)
             self.failed_urls = set(done_failed)
             self.queued_urls = set(enqueued)
+
+            if self.crawl_pdfs:
+                p_enq, p_started, p_done_ok, p_done_failed = self.pdf_state.load()
+                self.visited_pdfs = set(p_done_ok)
+            if self.raw_pdf_only or self.raw_pdf_urls:
+                r_enq, r_started, r_done_ok, r_done_failed = self.raw_pdf_state.load()
+                self.visited_raw_pdfs = set(r_done_ok)
 
             pending = (set(enqueued) | set(started)) - set(done_ok)
             if not self.retry_failed_on_resume:
@@ -1422,8 +1658,71 @@ class CrawlAIBenhVienScraper:
             self.queued_urls.add(start)
             await self.state.record("enqueue", start)
 
+        if initial_pdf_urls and self.crawl_mode != "pdf-only":
+            logger.info(f"[PDF-EXTRACT] Seed URLs queued: {len(initial_pdf_urls)}")
+            seen_initial_pdf_urls: set[str] = set()
+            for pdf_url in initial_pdf_urls:
+                if pdf_url in seen_initial_pdf_urls or pdf_url in self.visited_pdfs:
+                    continue
+                seen_initial_pdf_urls.add(pdf_url)
+                await pdf_q.put((pdf_url, ""))
+
+        if self.crawl_mode == "pdf-only":
+            initial_raw_pdf_urls.extend(initial_pdf_urls)
+
+        if initial_raw_pdf_urls:
+            logger.info(f"[PDF-RAW] Seed URLs queued: {len(initial_raw_pdf_urls)}")
+            seen_initial_raw_pdf_urls: set[str] = set()
+            for pdf_url in initial_raw_pdf_urls:
+                if (
+                    pdf_url in seen_initial_raw_pdf_urls
+                    or pdf_url in self.visited_raw_pdfs
+                ):
+                    continue
+                seen_initial_raw_pdf_urls.add(pdf_url)
+                await raw_pdf_q.put(pdf_url)
+
         stop_event = asyncio.Event()
+        html_workers_done = asyncio.Event()
         fatal_exc: Exception | None = None
+
+        async def raw_pdf_worker(worker_id: int):
+            while True:
+                try:
+                    pdf_url = await asyncio.wait_for(raw_pdf_q.get(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    if html_workers_done.is_set() and raw_pdf_q.empty():
+                        return
+                    continue
+                try:
+                    if stop_event.is_set():
+                        continue
+                    if pdf_url in self.visited_raw_pdfs:
+                        continue
+                    await self.raw_pdf_state.record("enqueue", pdf_url)
+                    await self._process_one_raw_pdf_url(pdf_url)
+                finally:
+                    raw_pdf_q.task_done()
+
+        async def pdf_worker(worker_id: int):
+            while True:
+                try:
+                    pdf_url, source_url = await asyncio.wait_for(
+                        pdf_q.get(), timeout=2.0
+                    )
+                except asyncio.TimeoutError:
+                    if html_workers_done.is_set() and pdf_q.empty():
+                        return
+                    continue
+                try:
+                    if stop_event.is_set():
+                        continue
+                    if pdf_url in self.visited_pdfs:
+                        continue
+                    await self.pdf_state.record("enqueue", pdf_url)
+                    await self._process_one_pdf(pdf_url, source_page_url=source_url)
+                finally:
+                    pdf_q.task_done()
 
         async def worker(worker_id: int):
             nonlocal fatal_exc
@@ -1440,27 +1739,52 @@ class CrawlAIBenhVienScraper:
                         continue
 
                     await self.state.record("start", url)
-                    item, discovered, err = await self._crawl_one(url)
+                    item, discovered, pdf_links, err = await self._crawl_one(url)
 
                     if item is not None and err is None:
-                        try:
-                            await self.db_writer.write(item)
-                        except Exception as e:
-                            self.failed_urls.add(url)
-                            await self.state.record(
-                                "done", url, ok=False, error=f"db_write_error: {e}"
+                        if self.crawl_mode == "pdf-only":
+                            logger.info(
+                                f"[HTML] Skip DB write in pdf-only mode: {url}"
                             )
-                        else:
                             self.visited_urls.add(url)
                             await self.state.record("done", url, ok=True)
-                            if (
-                                self.max_pages
-                                and len(self.visited_urls) >= self.max_pages
-                            ):
-                                stop_event.set()
+                        else:
+                            try:
+                                await self.db_writer.write(item)
+                            except Exception as e:
+                                self.failed_urls.add(url)
+                                await self.state.record(
+                                    "done", url, ok=False, error=f"db_write_error: {e}"
+                                )
+                            else:
+                                self.visited_urls.add(url)
+                                await self.state.record("done", url, ok=True)
+                                if (
+                                    self.max_pages
+                                    and len(self.visited_urls) >= self.max_pages
+                                ):
+                                    stop_event.set()
                     elif err:
                         self.failed_urls.add(url)
                         await self.state.record("done", url, ok=False, error=err)
+
+                    if pdf_links:
+                        for purl in pdf_links:
+                            if self.crawl_mode == "pdf-only":
+                                if purl in self.visited_raw_pdfs:
+                                    continue
+                                logger.info(
+                                    f"[PDF-DISCOVER] Queue raw PDF URL from page: {purl}"
+                                )
+                                await raw_pdf_q.put(purl)
+                                continue
+                            if purl in self.visited_pdfs:
+                                continue
+                            # do not block HTML crawling; let pdf workers drain
+                            logger.info(
+                                f"[PDF-DISCOVER] Queue extract PDF from page: {purl}"
+                            )
+                            await pdf_q.put((purl, url))
 
                     for nu in discovered:
                         if stop_event.is_set():
@@ -1473,11 +1797,36 @@ class CrawlAIBenhVienScraper:
                 finally:
                     q.task_done()
 
+        workers: list[asyncio.Task] = []
         workers = [asyncio.create_task(worker(i + 1)) for i in range(self.concurrency)]
+        pdf_workers: list[asyncio.Task] = []
+        if self.crawl_pdfs and self.crawl_mode != "pdf-only":
+            pdf_workers = [
+                asyncio.create_task(pdf_worker(i + 1))
+                for i in range(self.pdf_concurrency)
+            ]
+        raw_pdf_workers: list[asyncio.Task] = []
+        if self.raw_pdf_only or initial_raw_pdf_urls:
+            raw_pdf_workers = [
+                asyncio.create_task(raw_pdf_worker(i + 1))
+                for i in range(self.pdf_concurrency)
+            ]
         await q.join()
+        html_workers_done.set()
         for w in workers:
             w.cancel()
-        await asyncio.gather(*workers, return_exceptions=True)
+        if workers:
+            await asyncio.gather(*workers, return_exceptions=True)
+        if self.crawl_pdfs:
+            await pdf_q.join()
+            for w in pdf_workers:
+                w.cancel()
+            await asyncio.gather(*pdf_workers, return_exceptions=True)
+        if raw_pdf_workers:
+            await raw_pdf_q.join()
+            for w in raw_pdf_workers:
+                w.cancel()
+            await asyncio.gather(*raw_pdf_workers, return_exceptions=True)
         if fatal_exc is not None:
             raise fatal_exc
 
@@ -1491,23 +1840,87 @@ class CrawlAIBenhVienScraper:
 
             print("\n=== Crawl4AI Summary ===")
             print(f"Total URLs visited: {len(self.visited_urls)}")
-            print(
-                "Exported to Postgres tables: storage_data, storage_image, storage_video"
-            )
+            if self.crawl_mode == "pdf-only":
+                print(
+                    f"Raw PDF URLs saved to Postgres table: {self.db_writer._table_pdf}"
+                )
+            else:
+                print(
+                    "Exported to Postgres tables: storage_data, storage_image, storage_video"
+                )
+                if self.raw_pdf_urls:
+                    print(
+                        f"Raw PDF URLs saved to Postgres table: {self.db_writer._table_pdf}"
+                    )
         except Exception as e:
             logger.error(f"Fatal error: {e}")
 
 
 async def main():
+    import argparse
+
+    p = argparse.ArgumentParser(
+        description="Crawl benhvienanbinh.vn and write to Postgres."
+    )
+    p.add_argument("--start-url", default="https://benhvienanbinh.vn/")
+    p.add_argument("--max-pages", type=int, default=0, help="0 = no limit")
+    p.add_argument("--concurrency", type=int, default=6)
+    p.add_argument("--pdf-concurrency", type=int, default=2)
+    p.add_argument(
+        "--crawl-mode",
+        choices=("all", "pdf-only"),
+        default="all",
+        help="all = crawl normal content. pdf-only = only discover/save PDF URLs, do not write other page content.",
+    )
+    p.add_argument(
+        "--crawl-pdf",
+        action="store_true",
+        help="When enabled, discover .pdf links and extract their text into storage_data.",
+    )
+    p.add_argument(
+        "--pdf-url",
+        action="append",
+        default=[],
+        help="Repeatable. Crawl a PDF URL directly, without waiting for discovery from HTML pages.",
+    )
+    p.add_argument(
+        "--raw-pdf-url",
+        action="append",
+        default=[],
+        help="Repeatable. Save raw .pdf URLs into the configured PDF table without downloading PDF content.",
+    )
+    p.add_argument(
+        "--allow-domain",
+        action="append",
+        default=["www.benhvienanbinh.vn"],
+        help="Repeatable. Extra domains allowed (default includes www.benhvienanbinh.vn).",
+    )
+    p.add_argument("--page-timeout-ms", type=int, default=300_000)
+    p.add_argument("--output-root", default="data_craw")
+    p.add_argument(
+        "--no-resume", action="store_true", help="Disable resume from state files."
+    )
+    p.add_argument(
+        "--retry-failed-on-resume",
+        action="store_true",
+        help="When resuming, also retry previously failed URLs.",
+    )
+    args = p.parse_args()
+
     scraper = CrawlAIBenhVienScraper(
-        start_url="https://benhvienanbinh.vn/",
-        max_pages=None,
-        concurrency=6,
-        allow_domains=["www.benhvienanbinh.vn"],
-        page_timeout_ms=300_000,
-        output_root="data_craw",
-        resume=True,
-        retry_failed_on_resume=False,
+        start_url=args.start_url,
+        max_pages=(None if int(args.max_pages) <= 0 else int(args.max_pages)),
+        concurrency=int(args.concurrency),
+        pdf_concurrency=int(args.pdf_concurrency),
+        crawl_mode=str(args.crawl_mode),
+        crawl_pdfs=bool(args.crawl_pdf or args.pdf_url),
+        pdf_urls=list(args.pdf_url or []),
+        raw_pdf_urls=list(args.raw_pdf_url or []),
+        allow_domains=list(args.allow_domain or []),
+        page_timeout_ms=int(args.page_timeout_ms),
+        output_root=str(args.output_root),
+        resume=(not bool(args.no_resume)),
+        retry_failed_on_resume=bool(args.retry_failed_on_resume),
     )
     await scraper.run()
 

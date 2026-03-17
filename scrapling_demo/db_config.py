@@ -35,6 +35,29 @@ POSTGRES_CONFIG = PostgresConfig(
 )
 
 
+TABLE_STORAGE_DATA = "storage_data"
+TABLE_STORAGE_VIDEO = "storage_video"
+TABLE_STORAGE_IMAGE = "storage_image"
+TABLE_PDF = "pdf_documents"
+
+REQUIRED_TABLES = (
+    TABLE_STORAGE_DATA,
+    TABLE_STORAGE_IMAGE,
+    TABLE_STORAGE_VIDEO,
+    TABLE_PDF,
+)
+
+STORAGE_DATA_COLUMNS = ("id", "title", "content", "link", "created_at")
+STORAGE_VIDEO_COLUMNS = ("id", "storage_id", "video_url")
+STORAGE_IMAGE_COLUMNS = ("id", "storage_id", "image_url")
+PDF_COLUMNS = ("id", "file_name", "file_url", "content", "created_at")
+TABLE_COLUMNS = {
+    TABLE_STORAGE_DATA: STORAGE_DATA_COLUMNS,
+    TABLE_STORAGE_VIDEO: STORAGE_VIDEO_COLUMNS,
+    TABLE_STORAGE_IMAGE: STORAGE_IMAGE_COLUMNS,
+}
+
+
 def load_postgres_config() -> PostgresConfig:
     """Static config only (no .env, no env overrides)."""
     return POSTGRES_CONFIG
@@ -47,9 +70,31 @@ Server: http://192.168.1.66:5050 (giao diện web).
 Kết nối trực tiếp DB dùng host/port bên dưới (PostgreSQL thường dùng port 5432).
 """
 
-# Schema (chạy 1 lần để tạo bảng nếu chưa có):
-CREATE_TABLES_SQL = """
-CREATE TABLE IF NOT EXISTS storage_data (
+def _quote_ident(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def qualified_table_name(table_name: str, schema: str | None = None) -> str:
+    schema_name = schema or POSTGRES_CONFIG.schema or "public"
+    return f'{_quote_ident(schema_name)}.{_quote_ident(table_name)}'
+
+
+def _require_confirm(confirm: bool, action: str) -> None:
+    if not confirm:
+        raise RuntimeError(
+            f"Refusing to {action} without explicit confirmation. Pass confirm=True or use --confirm."
+        )
+
+
+def build_create_tables_sql(schema: str) -> str:
+    schema_ident = _quote_ident(schema or "public")
+    storage_data = qualified_table_name(TABLE_STORAGE_DATA, schema)
+    storage_video = qualified_table_name(TABLE_STORAGE_VIDEO, schema)
+    storage_image = qualified_table_name(TABLE_STORAGE_IMAGE, schema)
+    return f"""
+CREATE SCHEMA IF NOT EXISTS {schema_ident};
+
+CREATE TABLE IF NOT EXISTS {storage_data} (
     id UUID PRIMARY KEY,
     title VARCHAR(255),
     content TEXT,
@@ -57,45 +102,53 @@ CREATE TABLE IF NOT EXISTS storage_data (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE IF NOT EXISTS storage_video (
+CREATE TABLE IF NOT EXISTS {storage_video} (
     id UUID PRIMARY KEY,
-    storage_id UUID REFERENCES storage_data(id) ON DELETE CASCADE,
+    storage_id UUID REFERENCES {storage_data}(id) ON DELETE CASCADE,
     video_url TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS storage_image (
+CREATE TABLE IF NOT EXISTS {storage_image} (
     id UUID PRIMARY KEY,
-    storage_id UUID REFERENCES storage_data(id) ON DELETE CASCADE,
+    storage_id UUID REFERENCES {storage_data}(id) ON DELETE CASCADE,
     image_url TEXT NOT NULL
 );
 """
 
 
-def migrate_url_columns_to_text() -> None:
+def migrate_url_columns_to_text(*, confirm: bool = False) -> None:
     """
     Nâng giới hạn URL để tránh bị cắt (URL dài có token sẽ hỏng nếu bị truncate).
     An toàn khi chạy nhiều lần.
     """
+    _require_confirm(confirm, "migrate URL columns to TEXT")
+    schema = getattr(POSTGRES_CONFIG, "schema", None) or "public"
+    storage_data = qualified_table_name(TABLE_STORAGE_DATA, schema)
+    storage_video = qualified_table_name(TABLE_STORAGE_VIDEO, schema)
+    storage_image = qualified_table_name(TABLE_STORAGE_IMAGE, schema)
     conn = get_connection()
     cur = None
     try:
         cur = conn.cursor()
-        cur.execute("ALTER TABLE storage_data ALTER COLUMN link TYPE TEXT;")
-        cur.execute("ALTER TABLE storage_video ALTER COLUMN video_url TYPE TEXT;")
-        cur.execute("ALTER TABLE storage_image ALTER COLUMN image_url TYPE TEXT;")
+        cur.execute(f"ALTER TABLE {storage_data} ALTER COLUMN link TYPE TEXT;")
+        cur.execute(f"ALTER TABLE {storage_video} ALTER COLUMN video_url TYPE TEXT;")
+        cur.execute(f"ALTER TABLE {storage_image} ALTER COLUMN image_url TYPE TEXT;")
         conn.commit()
-        print("Đã migrate link/video_url/image_url sang TEXT.")
+        print(f"Đã migrate link/video_url/image_url sang TEXT trong schema {schema}.")
     finally:
         if cur:
             cur.close()
         conn.close()
 
 
-def migrate_youtube_embed_urls_to_watch() -> None:
+def migrate_youtube_embed_urls_to_watch(*, confirm: bool = False) -> None:
     """
     Chuyển URL YouTube dạng /embed/... trong storage_video sang dạng watch/playlist,
     đồng thời decode '&amp;' -> '&' và '//' -> 'https://'.
     """
+    _require_confirm(confirm, "migrate YouTube embed URLs")
+    schema = getattr(POSTGRES_CONFIG, "schema", None) or "public"
+    storage_video = qualified_table_name(TABLE_STORAGE_VIDEO, schema)
     conn = get_connection()
     cur = None
     try:
@@ -103,8 +156,8 @@ def migrate_youtube_embed_urls_to_watch() -> None:
 
         # Decode HTML entity first
         cur.execute(
-            """
-            UPDATE storage_video
+            f"""
+            UPDATE {storage_video}
             SET video_url = REPLACE(video_url, '&amp;', '&')
             WHERE video_url LIKE '%&amp;%';
             """
@@ -112,8 +165,8 @@ def migrate_youtube_embed_urls_to_watch() -> None:
 
         # Scheme-relative -> https
         cur.execute(
-            """
-            UPDATE storage_video
+            f"""
+            UPDATE {storage_video}
             SET video_url = 'https:' || video_url
             WHERE video_url LIKE '//%';
             """
@@ -121,8 +174,8 @@ def migrate_youtube_embed_urls_to_watch() -> None:
 
         # videoseries -> playlist?list=
         cur.execute(
-            """
-            UPDATE storage_video
+            f"""
+            UPDATE {storage_video}
             SET video_url = 'https://www.youtube.com/playlist?list=' ||
                 regexp_replace(video_url, '.*[\\?&]list=([^&]+).*', '\\1')
             WHERE video_url ~* 'youtube(\\-nocookie)?\\.com/embed/videoseries'
@@ -132,8 +185,8 @@ def migrate_youtube_embed_urls_to_watch() -> None:
 
         # /embed/<id> -> /watch?v=<id>
         cur.execute(
-            """
-            UPDATE storage_video
+            f"""
+            UPDATE {storage_video}
             SET video_url = 'https://www.youtube.com/watch?v=' ||
                 regexp_replace(video_url, '.*/embed/([^\\?&#/]+).*', '\\1')
             WHERE video_url ~* 'youtube(\\-nocookie)?\\.com/embed/'
@@ -142,7 +195,7 @@ def migrate_youtube_embed_urls_to_watch() -> None:
         )
 
         conn.commit()
-        print("Đã migrate URL YouTube embed -> watch/playlist trong storage_video.")
+        print(f"Đã migrate URL YouTube embed -> watch/playlist trong schema {schema}.")
     finally:
         if cur:
             cur.close()
@@ -150,17 +203,17 @@ def migrate_youtube_embed_urls_to_watch() -> None:
 
 
 # Server DB
-DB_HOST = "192.168.200.66"
-DB_PORT = 5050  # PostgreSQL mặc định; nếu DB chạy ở 5050 thì đổi thành 5050
-DB_NAME = "n8n"  # tên database, đổi nếu dùng DB khác
-DB_USER = "n8n"
-DB_PASSWORD = "123456"
-DB_SCHEMA = "n8n"  # đổi thành "n8n" nếu bạn dùng schema n8n (không phải public)
+DB_HOST = POSTGRES_CONFIG.host
+DB_PORT = POSTGRES_CONFIG.port
+DB_NAME = POSTGRES_CONFIG.database
+DB_USER = POSTGRES_CONFIG.username
+DB_PASSWORD = POSTGRES_CONFIG.password
+DB_SCHEMA = POSTGRES_CONFIG.schema
 
 
 # Connection string (để dùng với psycopg2 hoặc SQLAlchemy)
 def get_connection_string():
-    return f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+    return POSTGRES_CONFIG.dsn
 
 
 def get_connection():
@@ -169,18 +222,19 @@ def get_connection():
         import psycopg2
     except ImportError:
         raise ImportError("Cần cài: pip install psycopg2-binary")
+    cfg = load_postgres_config()
     conn = psycopg2.connect(
-        host=DB_HOST,
-        port=DB_PORT,
-        dbname=DB_NAME,
-        user=DB_USER,
-        password=DB_PASSWORD,
+        host=cfg.host,
+        port=cfg.port,
+        dbname=cfg.database,
+        user=cfg.username,
+        password=cfg.password,
     )
     # Ensure unqualified table names resolve to desired schema
     try:
         with conn.cursor() as cur:
             cur.execute(
-                'SET search_path TO "{}";'.format(str(DB_SCHEMA).replace('"', '""'))
+                'SET search_path TO "{}";'.format(str(cfg.schema).replace('"', '""'))
             )
         conn.commit()
     except Exception:
@@ -189,15 +243,17 @@ def get_connection():
     return conn
 
 
-def create_tables_if_not_exist():
+def create_tables_if_not_exist(*, confirm: bool = False):
     """Tạo 3 bảng storage_data, storage_video, storage_image nếu chưa có."""
+    _require_confirm(confirm, "create tables")
     conn = get_connection()
     cur = None
     try:
         cur = conn.cursor()
-        cur.execute(CREATE_TABLES_SQL)
+        schema = getattr(POSTGRES_CONFIG, "schema", None) or "public"
+        cur.execute(build_create_tables_sql(schema))
         conn.commit()
-        print("Đã tạo bảng (hoặc đã tồn tại).")
+        print(f"Đã tạo bảng (hoặc đã tồn tại) trong schema {schema}.")
     finally:
         if cur:
             cur.close()
@@ -207,15 +263,18 @@ def create_tables_if_not_exist():
 if __name__ == "__main__":
     import sys
 
-    if len(sys.argv) > 1 and sys.argv[1] == "create":
-        create_tables_if_not_exist()
-    elif len(sys.argv) > 1 and sys.argv[1] == "migrate":
-        create_tables_if_not_exist()
-        migrate_url_columns_to_text()
-    elif len(sys.argv) > 1 and sys.argv[1] == "migrate_youtube":
-        create_tables_if_not_exist()
-        migrate_url_columns_to_text()
-        migrate_youtube_embed_urls_to_watch()
+    args = set(sys.argv[1:])
+    confirm = "--confirm" in args
+
+    if "create" in args:
+        create_tables_if_not_exist(confirm=confirm)
+    elif "migrate" in args:
+        create_tables_if_not_exist(confirm=confirm)
+        migrate_url_columns_to_text(confirm=confirm)
+    elif "migrate_youtube" in args:
+        create_tables_if_not_exist(confirm=confirm)
+        migrate_url_columns_to_text(confirm=confirm)
+        migrate_youtube_embed_urls_to_watch(confirm=confirm)
     else:
         conn = get_connection()
         print("Kết nối DB thành công.")

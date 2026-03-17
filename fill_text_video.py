@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import uuid
+import time
 from typing import Any
 
 import pandas as pd
@@ -22,6 +23,45 @@ def _get_columns(cur, *, schema: str, table: str) -> set[str]:
         (schema, table),
     )
     return {r[0] for r in cur.fetchall()}
+
+
+def _find_table_schemas(cur, *, table: str) -> list[str]:
+    cur.execute(
+        """
+        SELECT table_schema
+        FROM information_schema.tables
+        WHERE table_type = 'BASE TABLE' AND table_name = %s
+        ORDER BY table_schema
+        """,
+        (table,),
+    )
+    return [r[0] for r in cur.fetchall()]
+
+
+def _connect_with_retries(
+    *,
+    dsn: str,
+    connect_timeout_s: int,
+    retries: int,
+    retry_delay_s: float,
+) -> psycopg2.extensions.connection:
+    last_err: Exception | None = None
+    attempts = max(1, int(retries) + 1)
+    for attempt in range(1, attempts + 1):
+        try:
+            return psycopg2.connect(dsn, connect_timeout=max(1, int(connect_timeout_s)))
+        except psycopg2.OperationalError as e:
+            last_err = e
+            if attempt >= attempts:
+                break
+            sleep_s = float(retry_delay_s) * (2 ** (attempt - 1))
+            print(
+                f"Postgres connect failed (attempt {attempt}/{attempts}): {e}. "
+                f"Retrying in {sleep_s:.1f}s..."
+            )
+            time.sleep(sleep_s)
+    assert last_err is not None
+    raise last_err
 
 
 def _to_uuid(value: Any) -> uuid.UUID | None:
@@ -51,7 +91,7 @@ def fill_text_video_from_excel(
     sheet_name: str | int | None,
     excel_storage_id_col: str,
     excel_text_col: str,
-    schema: str,
+    schema: str | None,
     table: str,
     key_col: str,
     target_col: str,
@@ -59,6 +99,9 @@ def fill_text_video_from_excel(
     only_null: bool,
     allow_empty_to_null: bool,
     dry_run: bool,
+    connect_timeout_s: int = 10,
+    connect_retries: int = 3,
+    connect_retry_delay_s: float = 1.0,
 ) -> int:
     # pandas behavior:
     # - sheet_name=None -> dict of all sheets
@@ -103,17 +146,43 @@ def fill_text_video_from_excel(
     cfg = load_postgres_config()
     print(f"Connecting Postgres: {cfg.host}:{cfg.port}/{cfg.database}")
 
-    conn = psycopg2.connect(cfg.dsn)
+    conn = _connect_with_retries(
+        dsn=cfg.dsn,
+        connect_timeout_s=connect_timeout_s,
+        retries=connect_retries,
+        retry_delay_s=connect_retry_delay_s,
+    )
     register_uuid(conn_or_curs=conn)
     cur = conn.cursor()
     try:
-        cols = _get_columns(cur, schema=schema, table=table)
+        effective_schema = (schema or "").strip() or getattr(cfg, "schema", "") or "public"
+        effective_table = (table or "").strip()
+        if not effective_table:
+            raise ValueError("Target table is empty.")
+
+        cols = _get_columns(cur, schema=effective_schema, table=effective_table)
         if not cols:
-            raise RuntimeError(f"Table {schema}.{table} not found.")
+            candidates = _find_table_schemas(cur, table=effective_table)
+            if len(candidates) == 1 and candidates[0] != effective_schema:
+                effective_schema = candidates[0]
+                cols = _get_columns(cur, schema=effective_schema, table=effective_table)
+            elif candidates:
+                raise RuntimeError(
+                    f"Table {effective_schema}.{effective_table} not found. "
+                    f"Found table '{effective_table}' in schemas: {candidates}. "
+                    f"Pass the right schema via --schema."
+                )
+            else:
+                raise RuntimeError(
+                    f"Table {effective_schema}.{effective_table} not found. "
+                    f"No table named '{effective_table}' exists in any schema."
+                )
+
         missing_cols = [c for c in (key_col, target_col) if c not in cols]
         if missing_cols:
             raise RuntimeError(
-                f"Table {schema}.{table} missing columns: {missing_cols}. Existing: {sorted(cols)}"
+                f"Table {effective_schema}.{effective_table} missing columns: {missing_cols}. "
+                f"Existing: {sorted(cols)}"
             )
 
         update_query = sql.SQL(
@@ -124,7 +193,7 @@ def fill_text_video_from_excel(
             WHERE sv.{key_col} = data.{key_col}
             """
         ).format(
-            table=sql.Identifier(schema, table),
+            table=sql.Identifier(effective_schema, effective_table),
             key_col=sql.Identifier(key_col),
             target_col=sql.Identifier(target_col),
         )
@@ -185,8 +254,8 @@ def main() -> int:
     )
     p.add_argument(
         "--schema",
-        default="public",
-        help="Postgres schema name (default: public). Example: --schema n8n",
+        default=None,
+        help="Postgres schema name (default: from db_config.py, fallback: public). Example: --schema n8n",
     )
     p.add_argument("--table", default="storage_video", help="Target table (default: storage_video)")
     p.add_argument(
@@ -200,6 +269,24 @@ def main() -> int:
         help="Target column to fill (default: text_video)",
     )
     p.add_argument("--batch-size", type=int, default=500, help="Batch size (default: 500)")
+    p.add_argument(
+        "--connect-timeout",
+        type=int,
+        default=10,
+        help="Postgres connect timeout seconds (default: 10).",
+    )
+    p.add_argument(
+        "--connect-retries",
+        type=int,
+        default=3,
+        help="Retries after initial connect attempt (default: 3).",
+    )
+    p.add_argument(
+        "--connect-retry-delay",
+        type=float,
+        default=1.0,
+        help="Initial retry delay seconds; doubles each retry (default: 1.0).",
+    )
     p.add_argument(
         "--only-null",
         action="store_true",
@@ -232,14 +319,17 @@ def main() -> int:
         sheet_name=sheet,
         excel_storage_id_col=args.excel_storage_id_col,
         excel_text_col=args.excel_text_col,
-        schema=(args.schema or "public").strip() or "public",
-        table=args.table,
+        schema=args.schema.strip() if isinstance(args.schema, str) else None,
+        table=(args.table or "").strip(),
         key_col=args.key_col,
         target_col=args.target_col,
         batch_size=max(1, int(args.batch_size)),
         only_null=bool(args.only_null),
         allow_empty_to_null=bool(args.allow_empty_to_null),
         dry_run=bool(args.dry_run),
+        connect_timeout_s=max(1, int(args.connect_timeout)),
+        connect_retries=max(0, int(args.connect_retries)),
+        connect_retry_delay_s=max(0.1, float(args.connect_retry_delay)),
     )
     return 0
 
