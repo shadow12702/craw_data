@@ -29,6 +29,59 @@ except Exception:  # pragma: no cover
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# =========================
+# Config (easy to customize)
+# =========================
+
+DEFAULT_START_URL = "https://thuocbietduoc.com.vn/"
+DEFAULT_OUTPUT_ROOT = "data_craw"
+
+DEFAULT_MAX_PAGES = 0  # 0 = unlimited
+DEFAULT_CONCURRENCY = 6
+DEFAULT_BROWSER_CONCURRENCY = 2
+DEFAULT_PAGE_TIMEOUT_MS = 300_000
+DEFAULT_RECYCLE_EVERY = 400  # 0 disables
+
+DEFAULT_CONNECT_ERROR_RETRY_LIMIT = 3
+
+DEFAULT_HTML_FILTER_BANNED_CLASS_MARKERS = (
+    "ft-chatbox-skin5",
+    "slidebar",
+    "post-sidebar",
+)
+
+DEFAULT_MAIN_BANNED_TAGS = {"nav", "header", "footer", "aside"}
+DEFAULT_MAIN_BANNED_CLASS_MARKERS = (
+    "breadcrumb",
+    "bread-crumb",
+    "breadcrumbs",
+    "crumb",
+    "menu",
+    "navbar",
+    "nav",
+    "header",
+    "footer",
+    "site-footer",
+    "site-header",
+    "topbar",
+)
+
+DEFAULT_FOOTER_TAIL_MARKERS = (
+    "©",
+    "all rights reserved",
+    "điều khoản sử dụng",
+    "chính sách bảo mật",
+    "chính sách thanh toán",
+    "chính sách đổi trả",
+    "liên hệ",
+    "hotline",
+    "email",
+)
+
+# URL sanity guard (avoid malformed/template URLs in the queue)
+DEFAULT_SKIP_URL_CONTAINS = ("${", "}")
+DEFAULT_SKIP_URL_IF_HAS_WHITESPACE = True
+
 # Windows PowerShell default encoding can be cp1252/cp936 and crash on unicode output.
 try:  # pragma: no cover
     if hasattr(sys.stdout, "reconfigure"):
@@ -74,6 +127,11 @@ def _is_file_url(url: str) -> bool:
 
 def _is_crawlable_page_url(url: str) -> bool:
     u = (url or "").lower()
+    # Guard against template/invalid URLs that can slip from malformed HTML.
+    if any(tok in u for tok in DEFAULT_SKIP_URL_CONTAINS):
+        return False
+    if DEFAULT_SKIP_URL_IF_HAS_WHITESPACE and any(ch.isspace() for ch in u):
+        return False
     if any(
         s in u for s in ("logout", "login", "wp-admin", "/admin", "mailto:", "tel:")
     ):
@@ -106,7 +164,7 @@ def _is_crawlable_page_url(url: str) -> bool:
     return True
 
 
-_RETRYABLE_CONNECTION_ERROR_MARKERS = (
+DEFAULT_RETRYABLE_CONNECTION_ERROR_MARKERS = (
     "err_connection_reset",
     "err_connection_closed",
     "err_connection_timed_out",
@@ -119,6 +177,9 @@ _RETRYABLE_CONNECTION_ERROR_MARKERS = (
     "connection refused",
     "connection aborted",
     "temporarily unavailable",
+    # Playwright resource pressure / remote object GC
+    "unbounded heap growth",
+    "object has been collected",
 )
 
 
@@ -128,7 +189,7 @@ def _is_retryable_connection_error(reason: Optional[str]) -> bool:
         return False
     if "crawl_failed" not in text and "fetch_error" not in text:
         return False
-    return any(marker in text for marker in _RETRYABLE_CONNECTION_ERROR_MARKERS)
+    return any(marker in text for marker in DEFAULT_RETRYABLE_CONNECTION_ERROR_MARKERS)
 
 
 # Reuse proven extraction/normalization utilities from the existing scraper.
@@ -315,21 +376,8 @@ def filter_main_html_for_content(main_html: str) -> str:
 
     from html.parser import HTMLParser
 
-    banned_tags = {"nav", "header", "footer", "aside"}
-    banned_class_markers = (
-        "breadcrumb",
-        "bread-crumb",
-        "breadcrumbs",
-        "crumb",
-        "menu",
-        "navbar",
-        "nav",
-        "header",
-        "footer",
-        "site-footer",
-        "site-header",
-        "topbar",
-    )
+    banned_tags = DEFAULT_MAIN_BANNED_TAGS
+    banned_class_markers = DEFAULT_MAIN_BANNED_CLASS_MARKERS
 
     class _Filter(HTMLParser):
         def __init__(self):
@@ -363,7 +411,16 @@ def filter_main_html_for_content(main_html: str) -> str:
         def _should_skip_by_class(tag: str, attrs) -> bool:
             t = (tag or "").lower()
             # only consider skipping common container tags
-            if t not in {"div", "section", "ul", "ol", "nav", "header", "footer", "aside"}:
+            if t not in {
+                "div",
+                "section",
+                "ul",
+                "ol",
+                "nav",
+                "header",
+                "footer",
+                "aside",
+            }:
                 return False
             ad = _Filter._attrs_dict(attrs)
             cls = (ad.get("class") or "").lower()
@@ -444,17 +501,7 @@ def strip_breadcrumb_and_footer_text(text: str) -> str:
         lines = lines[head_cut:]
 
     # Drop footer tail (policies/contact/copyright)
-    tail_markers = (
-        "©",
-        "all rights reserved",
-        "điều khoản sử dụng",
-        "chính sách bảo mật",
-        "chính sách thanh toán",
-        "chính sách đổi trả",
-        "liên hệ",
-        "hotline",
-        "email",
-    )
+    tail_markers = DEFAULT_FOOTER_TAIL_MARKERS
     tail_idx = None
     for i in range(len(lines) - 1, max(-1, len(lines) - 40), -1):
         l = lines[i].lower()
@@ -654,15 +701,18 @@ class PostgresWriterBietDuoc:
 class CrawlThuocBietDuocScraper:
     def __init__(
         self,
-        start_url: str = "https://thuocbietduoc.com.vn/",
+        start_url: str = DEFAULT_START_URL,
         *,
         max_pages: Optional[int] = None,
-        concurrency: int = 6,
-        page_timeout_ms: int = 300_000,
-        output_root: str = "data_craw",
+        concurrency: int = DEFAULT_CONCURRENCY,
+        browser_concurrency: int = DEFAULT_BROWSER_CONCURRENCY,
+        recycle_every: int = DEFAULT_RECYCLE_EVERY,
+        page_timeout_ms: int = DEFAULT_PAGE_TIMEOUT_MS,
+        output_root: str = DEFAULT_OUTPUT_ROOT,
         resume: bool = True,
         retry_failed_on_resume: bool = False,
         allow_domains: Optional[list[str]] = None,
+        connect_error_retry_limit: int = DEFAULT_CONNECT_ERROR_RETRY_LIMIT,
     ):
         self.start_url = start_url
         host = urlparse(start_url).netloc.lower().strip(".")
@@ -673,6 +723,17 @@ class CrawlThuocBietDuocScraper:
 
         self.max_pages = max_pages if max_pages and int(max_pages) > 0 else None
         self.concurrency = max(1, int(concurrency))
+        # Limit the number of concurrent Playwright page/context operations.
+        # This reduces "The object has been collected to prevent unbounded heap growth".
+        self.browser_concurrency = max(1, int(browser_concurrency))
+        self._browser_sem = asyncio.Semaphore(self.browser_concurrency)
+        # Periodically recycle crawler/browser to avoid long-run Playwright heap pressure.
+        self.recycle_every = max(0, int(recycle_every or 0))
+        self._arun_calls = 0
+        self._arun_calls_lock = asyncio.Lock()
+        self._recycle_lock = asyncio.Lock()
+        self._crawler_ref_lock = asyncio.Lock()
+        self._crawler_ctx: Optional[AsyncWebCrawler] = None
         self.page_timeout_ms = int(page_timeout_ms)
         self.output_root = output_root
         self.resume = bool(resume)
@@ -693,7 +754,53 @@ class CrawlThuocBietDuocScraper:
         self.failed_urls: set[str] = set()
         self.processing_urls: set[str] = set()
         self.queued_urls: set[str] = set()
-        self.connect_error_retry_limit = 3
+        self.connect_error_retry_limit = max(0, int(connect_error_retry_limit))
+
+    async def _start_crawler(self) -> None:
+        ctx = AsyncWebCrawler()
+        crawler = await ctx.__aenter__()
+        async with self._crawler_ref_lock:
+            self._crawler_ctx = ctx
+            self.crawler = crawler
+
+    async def _stop_crawler(self) -> None:
+        async with self._crawler_ref_lock:
+            ctx = self._crawler_ctx
+            self._crawler_ctx = None
+            self.crawler = None
+        if ctx is not None:
+            await ctx.__aexit__(None, None, None)
+
+    async def _recycle_crawler(self, reason: str) -> None:
+        if self.recycle_every <= 0:
+            return
+        async with self._recycle_lock:
+            # Drain permits so no Playwright work is in-flight.
+            for _ in range(self.browser_concurrency):
+                await self._browser_sem.acquire()
+            try:
+                try:
+                    await self._stop_crawler()
+                except Exception as e:
+                    logger.warning(f"[CRAWLER] Stop failed during recycle: {e}")
+                await self._start_crawler()
+                logger.info(
+                    f"[CRAWLER] Recycled crawler (reason={reason}, arun_calls={self._arun_calls})"
+                )
+            finally:
+                for _ in range(self.browser_concurrency):
+                    self._browser_sem.release()
+
+    async def _note_arun_call_and_maybe_recycle(self) -> None:
+        if self.recycle_every <= 0:
+            return
+        do_recycle = False
+        async with self._arun_calls_lock:
+            self._arun_calls += 1
+            if self.recycle_every > 0 and (self._arun_calls % self.recycle_every == 0):
+                do_recycle = True
+        if do_recycle:
+            await self._recycle_crawler(reason=f"every_{self.recycle_every}")
 
     def _is_allowed(self, url: str) -> bool:
         return is_related_domain(url, self.base_domain, self.allow_domains)
@@ -716,14 +823,23 @@ class CrawlThuocBietDuocScraper:
         )
 
         try:
-            if CrawlerRunConfig is not None:
-                kwargs = {"page_timeout": self.page_timeout_ms}
-                if CacheMode is not None:
-                    kwargs["cache_mode"] = CacheMode.BYPASS
-                run_config = CrawlerRunConfig(**kwargs)
-                result = await self.crawler.arun(url=url, config=run_config)  # type: ignore[union-attr]
-            else:
-                result = await self.crawler.arun(url=url)  # type: ignore[union-attr]
+            await self._browser_sem.acquire()
+            try:
+                async with self._crawler_ref_lock:
+                    crawler = self.crawler
+                if crawler is None:
+                    return None, [], "crawl_failed: crawler_not_initialized"
+                if CrawlerRunConfig is not None:
+                    kwargs = {"page_timeout": self.page_timeout_ms}
+                    if CacheMode is not None:
+                        kwargs["cache_mode"] = CacheMode.BYPASS
+                    run_config = CrawlerRunConfig(**kwargs)
+                    result = await crawler.arun(url=url, config=run_config)
+                else:
+                    result = await crawler.arun(url=url)
+            finally:
+                self._browser_sem.release()
+                await self._note_arun_call_and_maybe_recycle()
 
             if not getattr(result, "success", False):
                 msg = getattr(result, "error_message", "") or "unknown error"
@@ -760,7 +876,7 @@ class CrawlThuocBietDuocScraper:
             files = extract_files(md_for_media, entry_html, url)
 
             html_filter = _HTMLFilterRemoveDivByClass(
-                banned_class_markers=("ft-chatbox-skin5", "slidebar", "post-sidebar")
+                banned_class_markers=DEFAULT_HTML_FILTER_BANNED_CLASS_MARKERS
             )
             try:
                 html_filter.feed(entry_html)
@@ -799,7 +915,11 @@ class CrawlThuocBietDuocScraper:
     async def _crawl_one_with_retry(
         self, url: str
     ) -> tuple[Optional[PageItem], list[str], Optional[str]]:
-        last_result: tuple[Optional[PageItem], list[str], Optional[str]] = (None, [], None)
+        last_result: tuple[Optional[PageItem], list[str], Optional[str]] = (
+            None,
+            [],
+            None,
+        )
         max_attempts = 1 + int(self.connect_error_retry_limit)
         for attempt in range(1, max_attempts + 1):
             page, new_urls, skip_reason = await self._crawl_one(url)
@@ -910,18 +1030,22 @@ class CrawlThuocBietDuocScraper:
             await self.state.record("enqueue", self.start_url)
             q.put_nowait(self.start_url)
 
-        async with AsyncWebCrawler() as crawler:
-            self.crawler = crawler
+        workers: list[asyncio.Task] = []
+        try:
+            await self._start_crawler()
             workers = [
                 asyncio.create_task(self._worker(q)) for _ in range(self.concurrency)
             ]
             await q.join()
+        finally:
             for w in workers:
                 w.cancel()
             await asyncio.gather(*workers, return_exceptions=True)
-            self.crawler = None
-
-        await self.db_writer.stop()
+            try:
+                await self._stop_crawler()
+            except Exception as e:
+                logger.warning(f"[CRAWLER] Stop failed: {e}")
+            await self.db_writer.stop()
 
 
 def _parse_args(argv: list[str]) -> dict:
@@ -930,11 +1054,31 @@ def _parse_args(argv: list[str]) -> dict:
     p = argparse.ArgumentParser(
         description="Crawl thuocbietduoc.com.vn and store into *_bietduoc tables (with resume)."
     )
-    p.add_argument("--start-url", default="https://thuocbietduoc.com.vn/")
-    p.add_argument("--max-pages", type=int, default=0, help="0 = unlimited")
-    p.add_argument("--concurrency", type=int, default=6)
-    p.add_argument("--page-timeout-ms", type=int, default=300_000)
-    p.add_argument("--output-root", default="data_craw")
+    p.add_argument("--start-url", default=DEFAULT_START_URL)
+    p.add_argument(
+        "--max-pages", type=int, default=DEFAULT_MAX_PAGES, help="0 = unlimited"
+    )
+    p.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
+    p.add_argument(
+        "--browser-concurrency",
+        type=int,
+        default=DEFAULT_BROWSER_CONCURRENCY,
+        help="Limit concurrent Playwright page/context work (reduces 'object has been collected' errors).",
+    )
+    p.add_argument(
+        "--recycle-every",
+        type=int,
+        default=DEFAULT_RECYCLE_EVERY,
+        help="Recycle crawler/browser every N arun calls (0 disables). Helps long runs stability.",
+    )
+    p.add_argument("--page-timeout-ms", type=int, default=DEFAULT_PAGE_TIMEOUT_MS)
+    p.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT)
+    p.add_argument(
+        "--connect-error-retry-limit",
+        type=int,
+        default=DEFAULT_CONNECT_ERROR_RETRY_LIMIT,
+        help="Retries for retryable connection/Playwright transient errors.",
+    )
     p.add_argument("--no-resume", action="store_true")
     p.add_argument("--retry-failed-on-resume", action="store_true")
     p.add_argument(
@@ -954,11 +1098,14 @@ async def main(argv: Optional[list[str]] = None) -> int:
             (args["max_pages"] or None) if int(args["max_pages"] or 0) > 0 else None
         ),
         concurrency=args["concurrency"],
+        browser_concurrency=args["browser_concurrency"],
+        recycle_every=args["recycle_every"],
         page_timeout_ms=args["page_timeout_ms"],
         output_root=args["output_root"],
         resume=not bool(args["no_resume"]),
         retry_failed_on_resume=bool(args["retry_failed_on_resume"]),
         allow_domains=args["allow_domain"] or [],
+        connect_error_retry_limit=args["connect_error_retry_limit"],
     )
 
     Path(args["output_root"]).mkdir(parents=True, exist_ok=True)
