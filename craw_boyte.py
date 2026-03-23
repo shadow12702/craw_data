@@ -927,9 +927,7 @@ class CrawlBoYTeScraper:
                     kwargs["cache_mode"] = CacheMode.BYPASS
                 use_render_wait = _should_use_render_wait(url)
                 wait_for = (
-                    build_render_wait_for_condition(
-                        RENDER_WAIT_FOR_SELECTOR_CANDIDATES
-                    )
+                    build_render_wait_for_condition(RENDER_WAIT_FOR_SELECTOR_CANDIDATES)
                     if use_render_wait
                     else None
                 )
@@ -990,9 +988,7 @@ class CrawlBoYTeScraper:
                 f"[HTML] Discovered {len(deduped)} crawlable link(s) from: {url}"
             )
             if deduped:
-                logger.info(
-                    f"[HTML] Sample discovered URLs: {deduped[:5]}"
-                )
+                logger.info(f"[HTML] Sample discovered URLs: {deduped[:5]}")
 
             md_for_media = (
                 strip_navigation_menu_from_markdown(markdown) if markdown else ""
@@ -1040,7 +1036,11 @@ class CrawlBoYTeScraper:
     async def _crawl_one_with_retry(
         self, url: str
     ) -> tuple[Optional[PageItem], list[str], Optional[str]]:
-        last_result: tuple[Optional[PageItem], list[str], Optional[str]] = (None, [], None)
+        last_result: tuple[Optional[PageItem], list[str], Optional[str]] = (
+            None,
+            [],
+            None,
+        )
         max_attempts = 1 + int(self.connect_error_retry_limit)
         for attempt in range(1, max_attempts + 1):
             page, new_urls, skip_reason = await self._crawl_one(url)
@@ -1164,10 +1164,17 @@ class CrawlBoYTeScraper:
             workers = [
                 asyncio.create_task(self._worker(q)) for _ in range(self.concurrency)
             ]
-            await q.join()
-            for w in workers:
-                w.cancel()
-            await asyncio.gather(*workers, return_exceptions=True)
+            try:
+                await q.join()
+            except KeyboardInterrupt:
+                # Ctrl+C: hủy worker trước khi context đóng browser — giảm TargetClosedError / future lạc.
+                logger.warning(
+                    "KeyboardInterrupt — đang hủy worker, sau đó đóng browser (resume vẫn dùng state JSONL)."
+                )
+            finally:
+                for w in workers:
+                    w.cancel()
+                await asyncio.gather(*workers, return_exceptions=True)
             self.crawler = None
 
         await self.db_writer.stop()
