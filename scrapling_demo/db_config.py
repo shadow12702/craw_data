@@ -25,7 +25,7 @@ POSTGRES_CONFIG = PostgresConfig(
     # NOTE:
     # - Inside Docker network: host is usually "pgvector"
     # - From Windows host (outside Docker): use Docker host IP or localhost (because ports: "5432:5432")
-    host="192.168.200.66",
+    host="192.168.100.68",
     port=5432,
     database="n8n",
     username="n8n",
